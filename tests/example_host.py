@@ -65,4 +65,5 @@ def build_kit(settings: ConsentSettings | None = None) -> ConsentKit:
 def build_app(kit: ConsentKit) -> FastAPI:
     app = FastAPI()
     app.include_router(kit.owner_router(prefix="/subjects"))
+    app.include_router(kit.public_router())
     return app
