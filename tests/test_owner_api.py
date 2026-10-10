@@ -201,3 +201,13 @@ def test_kit_python_api(kit, client, owner):
         assert kit.can_send(db, uuid.UUID(subject_id), "service") is False
         assert kit.sendable_subjects(db, owner_id, "service") == []
         assert kit.audit(db, uuid.UUID(subject_id)).events == []
+
+
+def test_kit_refuses_to_start_without_a_sender_for_real_codes():
+    import example_host
+
+    from whatsapp_consent.config import ConsentSettings
+    from whatsapp_consent.senders import SenderNotConfigured
+
+    with pytest.raises(SenderNotConfigured):
+        example_host.build_kit(ConsentSettings(verification_method="authentication_template"))  # pyright: ignore[reportCallIssue]

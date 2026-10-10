@@ -13,6 +13,7 @@ from whatsapp_consent.config import ConsentSettings
 from whatsapp_consent.enums import Language, TemplateCategory
 from whatsapp_consent.gate import can_send, can_send_category, sendable_subjects
 from whatsapp_consent.models import Subject
+from whatsapp_consent.senders import VerificationSender, resolve_sender
 from whatsapp_consent.status import SubjectState, state_of, status_by_phone
 
 
@@ -45,7 +46,7 @@ class ConsentKit:
         session_dependency: Callable[..., Any],
         owner_dependency: Callable[..., Any],
         owner_lookup: OwnerLookup,
-        sender: Any = None,
+        sender: VerificationSender | None = None,
         on_subject_erased: ErasureHook | None = None,
     ) -> None:
         """
@@ -60,7 +61,7 @@ class ConsentKit:
         self.session_dependency = session_dependency
         self.owner_dependency = owner_dependency
         self.owner_lookup = owner_lookup
-        self.sender = sender
+        self.sender: VerificationSender = resolve_sender(settings, sender)
         self.on_subject_erased = on_subject_erased
 
     @property
