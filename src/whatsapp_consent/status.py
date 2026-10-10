@@ -111,7 +111,7 @@ def subjects_by_phone(db: Session, owner_id: uuid.UUID, phone: str, *, key: str)
     """An owner's subjects on a number (a parent may have several children). Raises InvalidPhone."""
     fingerprint = phone_fingerprint(key, normalise_phone(phone))
     query = select(Subject).where(Subject.owner_id == owner_id, Subject.phone_fingerprint == fingerprint)
-    return list(db.scalars(query.order_by(Subject.created_at)))
+    return list(db.scalars(query.order_by(Subject.created_at, Subject.id)))
 
 
 def status_by_phone(db: Session, owner_id: uuid.UUID, phone: str, *, key: str) -> list[SubjectState]:

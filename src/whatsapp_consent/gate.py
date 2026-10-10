@@ -63,6 +63,6 @@ def sendable_subjects(db: Session, owner_id: uuid.UUID, purpose: str) -> list[uu
             Subject.needs_review.is_(False),
             Subject.minor_suspended.is_(False),
         )
-        .order_by(Subject.created_at)
+        .order_by(Subject.created_at, Subject.id)
     )
     return list(db.scalars(query))

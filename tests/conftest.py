@@ -98,3 +98,54 @@ def make_subject(db, owner_id):
         return subject
 
     return make
+
+
+from contextlib import contextmanager  # noqa: E402
+
+
+def local_phone() -> str:
+    """A random Indian mobile the way people type it (no +91)."""
+    return f"98{secrets.randbelow(10**8):08d}"
+
+
+@contextmanager
+def committed_session():
+    """A session whose changes are committed, for setting up state the API will read."""
+    import example_host
+
+    with example_host.session() as db:
+        yield db
+        db.commit()
+
+
+@pytest.fixture(scope="session")
+def kit(database):
+    import example_host
+
+    example_host.configure_database(database)
+    return example_host.build_kit()
+
+
+@pytest.fixture
+def client(kit):
+    import example_host
+    from fastapi.testclient import TestClient
+
+    with TestClient(example_host.build_app(kit)) as test_client:
+        yield test_client
+
+
+@pytest.fixture
+def owner():
+    """Registers an owner with the example host; returns (owner_id, auth headers)."""
+    import example_host
+
+    from whatsapp_consent.enums import Language
+    from whatsapp_consent.kit import OwnerInfo
+
+    def make(display_name="Priya Nutrition", language="en", whatsapp_number=None):
+        owner_id = uuid.uuid4()
+        example_host.OWNERS[owner_id] = OwnerInfo(display_name, Language(language), whatsapp_number)
+        return owner_id, {"X-Owner-Id": str(owner_id)}
+
+    return make

@@ -35,6 +35,8 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Installed Starlette warns that its TestClient uses httpx; the tests need the TestClient as it is.
+filterwarnings = ["ignore:Using `httpx` with `starlette.testclient` is deprecated:starlette.exceptions.StarletteDeprecationWarning"]
 
 [tool.pyright]
 include = ["src", "tests"]
