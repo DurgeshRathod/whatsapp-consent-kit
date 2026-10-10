@@ -57,3 +57,44 @@ def db(engine):
     with Session(engine, expire_on_commit=False) as session:
         yield session
         session.rollback()
+
+
+import uuid  # noqa: E402
+
+
+def random_phone() -> str:
+    """A random Indian mobile in E.164, so tests never share per-number limits."""
+    return f"+9198{secrets.randbelow(10**8):08d}"
+
+
+@pytest.fixture
+def owner_id():
+    return uuid.uuid4()
+
+
+@pytest.fixture
+def make_subject(db, owner_id):
+    from datetime import UTC, datetime
+
+    from whatsapp_consent.enums import SubjectSource
+    from whatsapp_consent.hashing import phone_fingerprint
+    from whatsapp_consent.models import Subject
+
+    key = os.environ["CONSENT_FINGERPRINT_KEY"]
+
+    def make(*, owner=None, name="Asha", phone=None, verified=True, **fields):
+        phone = phone or random_phone()
+        subject = Subject(
+            owner_id=owner or owner_id,
+            display_name=name,
+            phone_e164=phone,
+            phone_fingerprint=phone_fingerprint(key, phone),
+            source=fields.pop("source", SubjectSource.PERSONAL_LINK),
+            phone_verified_at=datetime.now(UTC) if verified else None,
+            **fields,
+        )
+        db.add(subject)
+        db.flush()
+        return subject
+
+    return make
