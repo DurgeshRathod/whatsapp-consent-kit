@@ -107,7 +107,8 @@ def check_code(
 ) -> Verification:
     """Marks a typed code verified, or raises. A wrong code increments `attempts` first: commit after catching."""
     now = now or datetime.now(UTC)
-    verification = db.get(Verification, verification_id)
+    # Row lock: concurrent guesses must not share one attempts count.
+    verification = db.get(Verification, verification_id, with_for_update=True)
     if (
         verification is None
         or verification.purpose != purpose

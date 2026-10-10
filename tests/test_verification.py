@@ -169,7 +169,12 @@ def test_rate_limiter_counts_per_key_within_the_window(db, key):
     attempts = [allow(db, bucket="test", key=ip, limit=2, window=hour, hash_key=key, now=T0) for _ in range(3)]
     assert attempts == [True, True, False]
     assert allow(db, bucket="test", key=ip, limit=2, window=hour, hash_key=key, now=T0 + timedelta(minutes=61))
-    assert ip not in db.scalars(select(RateLimitEvent.key_hash)).all()
+    from whatsapp_consent.hashing import keyed_hash
+
+    expected = keyed_hash(key, "ratelimit:test", ip)
+    stored = db.scalars(select(RateLimitEvent.key_hash).where(RateLimitEvent.bucket == "test")).all()
+    assert stored.count(expected) == 3
+    assert ip not in stored
 
 
 def test_sender_resolution():
