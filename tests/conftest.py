@@ -29,6 +29,12 @@ def database() -> Iterator[str]:
         conn.execute(text(f'CREATE DATABASE "{TEST_DB}"'))
     try:
         migrate(TEST_URL)
+        content_engine = create_engine(TEST_URL)
+        with content_engine.begin() as conn:
+            from sample_content import load_sample_content
+
+            load_sample_content(conn)
+        content_engine.dispose()
         yield TEST_URL
     finally:
         with admin.connect() as conn:

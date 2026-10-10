@@ -1,7 +1,7 @@
 """Initial schema: subjects, invites, purposes, notices, consent history, verification, preferences, erasure.
 
 CHECK constraints list each enum's values literally. Adding an enum value needs a new migration that widens the
-constraint (tests/test_schema.py::test_check_constraints_match_the_enums enforces it).
+constraint (tests/test_zz_schema.py::test_check_constraints_match_the_enums enforces it).
 
 Revision ID: 0001
 Revises:
