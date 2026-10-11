@@ -2,7 +2,7 @@
 
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Literal
+from typing import Any, Literal
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -41,6 +41,7 @@ def start_code_verification(
     sender: VerificationSender,
     key: str,
     subject_id: uuid.UUID | None = None,
+    pending: dict[str, Any] | None = None,
     now: datetime | None = None,
 ) -> Verification:
     """Sends a 6-digit code. Limits count only codes we sent (not click-to-chat codes)."""
@@ -69,6 +70,7 @@ def start_code_verification(
         method=sender.method,
         code_hash=hash_code(key, purpose.value, phone, code),
         expires_at=now + CODE_TTL,
+        pending=pending,
         created_at=now,
     )
     db.add(verification)
@@ -77,7 +79,13 @@ def start_code_verification(
 
 
 def start_click_verification(
-    db: Session, *, phone: str, subject_id: uuid.UUID, key: str, now: datetime | None = None
+    db: Session,
+    *,
+    phone: str,
+    subject_id: uuid.UUID,
+    key: str,
+    pending: dict[str, Any] | None = None,
+    now: datetime | None = None,
 ) -> tuple[Verification, str]:
     """A code the person sends to the owner's number (`START-XXXXXX`). Nothing is sent by us."""
     now = now or datetime.now(UTC)
@@ -89,6 +97,7 @@ def start_click_verification(
         method=VerificationMethod.CLICK_TO_CHAT,
         code_hash=hash_code(key, CLICK_HASH_PURPOSE, phone, code),
         expires_at=now + CLICK_CODE_TTL,
+        pending=pending,
         created_at=now,
     )
     db.add(verification)

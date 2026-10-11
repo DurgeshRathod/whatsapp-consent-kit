@@ -110,6 +110,10 @@ STRINGS: dict[str, dict[str, str]] = {
         "en": "Because you're under 18, a parent or guardian needs to fill this in.",
         "hi": "आपकी उम्र 18 वर्ष से कम है, इसलिए इसे माता-पिता या अभिभावक को भरना होगा।",
     },
+    "err_minor_needs_guardian": {
+        "en": "This person is recorded as under 18. Please fill this in as their parent or guardian.",
+        "hi": "इस व्यक्ति की उम्र 18 वर्ष से कम दर्ज है। कृपया माता-पिता या अभिभावक के रूप में भरें।",
+    },
     "err_duplicate": {
         "en": "Someone with this name and number is already registered with this business.",
         "hi": "इस नाम और नंबर वाला व्यक्ति पहले से इस व्यवसाय के साथ पंजीकृत है।",

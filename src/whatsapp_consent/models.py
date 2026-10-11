@@ -161,6 +161,8 @@ class Verification(ConsentBase):
     attempts: Mapped[int] = mapped_column(SmallInteger, default=0, server_default="0")
     expires_at: Mapped[datetime] = _timestamp()
     verified_at: Mapped[datetime | None] = _timestamp()
+    # A consent page submission held until this verification succeeds (see submissions.hold_consent).
+    pending: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = _now()
 
 

@@ -10,15 +10,23 @@ from fastapi.responses import HTMLResponse, Response
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from whatsapp_consent.enums import Language, VerificationPurpose
+from whatsapp_consent.enums import Language, VerificationMethod, VerificationPurpose
 from whatsapp_consent.events import Evidence, active_purposes, purpose_codes
+from whatsapp_consent.hashing import phone_fingerprint
 from whatsapp_consent.invites import resolve_invite
 from whatsapp_consent.models import Invite, Subject, Verification
 from whatsapp_consent.notices import latest_notice
 from whatsapp_consent.phones import local_display, mask_phone
 from whatsapp_consent.preference_links import issue_preference_link, preference_url
 from whatsapp_consent.ratelimit import allow
-from whatsapp_consent.submissions import complete_consent_verification, submit_consent
+from whatsapp_consent.submissions import (
+    DuplicateSubject,
+    InviteAlreadyUsed,
+    MinorNeedsGuardian,
+    complete_consent_verification,
+    hold_consent,
+    pending_payload,
+)
 from whatsapp_consent.verification import (
     VerificationError,
     check_code,
@@ -147,9 +155,18 @@ def build(kit: "ConsentKit", pages: Pages) -> APIRouter:
             business=info.display_name if info else "",
         )
 
-    def finish(db: Session, subject: Subject, lang: Language) -> Response:
-        complete_consent_verification(db, subject)
-        token = issue_preference_link(db, subject.phone_fingerprint)
+    def flow_row(db: Session, flow: dict, field: str) -> Verification | None:
+        """The flow's verification row, only if it is a consent verification for the flow's subject."""
+        if not flow.get(field) or not flow.get("s"):
+            return None
+        row = db.get(Verification, uuid.UUID(flow[field]))
+        if row is None or row.purpose != VerificationPurpose.CONSENT or row.subject_id != uuid.UUID(flow["s"]):
+            return None
+        return row
+
+    def finish(db: Session, subject: Subject, verification: Verification, lang: Language) -> Response:
+        """The number is proven and the held submission applied: hand out the preferences link for that number."""
+        token = issue_preference_link(db, phone_fingerprint(kit.key, verification.phone_e164))
         info = kit.owner_lookup(db, subject.owner_id)
         db.commit()
         response = pages.redirect(f"/c/done?lang={lang.value}")
@@ -169,7 +186,7 @@ def build(kit: "ConsentKit", pages: Pages) -> APIRouter:
         language = pages.flow_lang(lang, flow)
         if not flow or "s" not in flow:
             return pages.session_expired(request, language)
-        if flow.get("v") and db.get(Verification, uuid.UUID(flow["v"])) is None:
+        if (flow.get("v") and flow_row(db, flow, "v") is None) or (flow.get("cv") and flow_row(db, flow, "cv") is None):
             return pages.invalid_link(request, language)  # e.g. the owner erased the subject meanwhile
         return code_page(request, db, language, flow, sent=bool(sent))
 
@@ -185,17 +202,27 @@ def build(kit: "ConsentKit", pages: Pages) -> APIRouter:
         language = pages.flow_lang(lang, flow)
         if not flow or not flow.get("v") or not pages.csrf_ok(request, csrf):
             return pages.session_expired(request, language)
-        subject = db.get(Subject, uuid.UUID(flow["s"]))
-        if subject is None or db.get(Verification, uuid.UUID(flow["v"])) is None:
+        if flow_row(db, flow, "v") is None:
             return pages.invalid_link(request, language)
         try:
-            check_code(
+            verification = check_code(
                 db, verification_id=uuid.UUID(flow["v"]), purpose=VerificationPurpose.CONSENT, code=code, key=kit.key
             )
         except VerificationError as error:
             db.commit()  # keep the attempt count
             return code_page(request, db, language, flow, errors=[f"err_{error.reason}"], status_code=422)
-        return finish(db, subject, language)
+        try:
+            subject = complete_consent_verification(db, verification)
+        except InviteAlreadyUsed:
+            db.rollback()
+            return already_done(request, language)
+        except LookupError:
+            db.rollback()
+            return pages.invalid_link(request, language)
+        except IntegrityError:
+            db.rollback()
+            return code_page(request, db, language, flow, errors=["err_duplicate"], status_code=409)
+        return finish(db, subject, verification, language)
 
     @router.post("/c/verify/check", response_class=HTMLResponse)
     def click_check(
@@ -209,12 +236,15 @@ def build(kit: "ConsentKit", pages: Pages) -> APIRouter:
         language = pages.flow_lang(lang, flow)
         if not flow or "s" not in flow or not pages.csrf_ok(request, csrf):
             return pages.session_expired(request, language)
+        # Only the click-to-chat row this flow started counts; never the subject's verified state.
+        verification = flow_row(db, flow, "cv") if settings.click_to_chat else None
         subject = db.get(Subject, uuid.UUID(flow["s"]))
-        if subject is None:
+        if verification is None or verification.method != VerificationMethod.CLICK_TO_CHAT or subject is None:
             return pages.invalid_link(request, language)
-        if subject.phone_verified_at is None:
+        if verification.verified_at is None or verification.pending is not None:
+            # Not received yet (the inbound handler verifies the row and applies the held submission).
             return code_page(request, db, language, flow, errors=["err_not_received_yet"], status_code=422)
-        return finish(db, subject, language)
+        return finish(db, subject, verification, language)
 
     @router.post("/c/verify/resend", response_class=HTMLResponse)
     def resend(
@@ -227,7 +257,7 @@ def build(kit: "ConsentKit", pages: Pages) -> APIRouter:
         language = pages.flow_lang(lang, flow)
         if not flow or not flow.get("v") or not pages.csrf_ok(request, csrf):
             return pages.session_expired(request, language)
-        previous = db.get(Verification, uuid.UUID(flow["v"]))
+        previous = flow_row(db, flow, "v")
         if previous is None:
             return pages.invalid_link(request, language)
         limit = settings.web_submissions_per_ip_hour
@@ -243,6 +273,7 @@ def build(kit: "ConsentKit", pages: Pages) -> APIRouter:
                 sender=kit.sender,
                 key=kit.key,
                 subject_id=previous.subject_id,
+                pending=previous.pending,
             )
         except VerificationError as error:
             db.commit()
@@ -307,10 +338,10 @@ def build(kit: "ConsentKit", pages: Pages) -> APIRouter:
         if found is None:
             return pages.invalid_link(request, language)
         invite, info = found
-        if invite.used_at is not None:
-            return already_done(request, language)
         if not pages.csrf_ok(request, csrf):
             return pages.session_expired(request, language)
+        if invite.used_at is not None:
+            return already_done(request, language)
 
         who = "child" if invite.minor_only or who == "child" else "me"
         values = {
@@ -344,44 +375,54 @@ def build(kit: "ConsentKit", pages: Pages) -> APIRouter:
         if parsed.errors or parsed.submission is None:
             return again(parsed.errors)
 
+        submission = parsed.submission
+        notice = latest_notice(db, language)
+        evidence = Evidence(client_ip(request), request.headers.get("user-agent"))
         try:
-            subject = submit_consent(
-                db,
-                invite=invite,
-                submission=parsed.submission,
-                notice=latest_notice(db, language),
-                evidence=Evidence(client_ip(request), request.headers.get("user-agent")),
-                key=kit.key,
+            subject = hold_consent(
+                db, invite=invite, submission=submission, notice=notice, evidence=evidence, key=kit.key
             )
-        except IntegrityError:
+        except MinorNeedsGuardian:
+            db.rollback()
+            values["child_name"] = values["child_name"] or name
+            return again(["err_minor_needs_guardian"], 200, "child")
+        except (DuplicateSubject, IntegrityError):
             db.rollback()
             return again(["err_duplicate"], 409)
+        except LookupError:
+            db.rollback()
+            return pages.invalid_link(request, language)
+        held = pending_payload(invite=invite, submission=submission, notice=notice, evidence=evidence, key=kit.key)
 
         try:
             verification = start_code_verification(
                 db,
-                phone=subject.phone_e164,
+                phone=submission.phone,
                 purpose=VerificationPurpose.CONSENT,
                 language=language,
                 sender=kit.sender,
                 key=kit.key,
                 subject_id=subject.id,
+                pending=held,
             )
         except VerificationError as error:
-            pending = None
+            reused = None
             if error.reason == "too_soon":
-                pending = latest_pending(
-                    db, phone=subject.phone_e164, purpose=VerificationPurpose.CONSENT, subject_id=subject.id
+                reused = latest_pending(
+                    db, phone=submission.phone, purpose=VerificationPurpose.CONSENT, subject_id=subject.id
                 )
-            if pending is None:
+            if reused is None:
                 db.rollback()  # nothing is kept for a number we can't verify right now
                 return again([f"err_{error.reason}"], 429 if error.reason in ("too_soon", "rate_limited") else 422)
-            verification = pending
+            reused.pending = held  # the latest submission is the one the code will confirm
+            verification = reused
 
         flow = {"v": str(verification.id), "s": str(subject.id), "l": language.value}
         if settings.click_to_chat and info.whatsapp_number:
-            _, click_text = start_click_verification(db, phone=subject.phone_e164, subject_id=subject.id, key=kit.key)
-            flow["c"] = click_text
+            click, click_text = start_click_verification(
+                db, phone=submission.phone, subject_id=subject.id, key=kit.key, pending=held
+            )
+            flow |= {"cv": str(click.id), "c": click_text}
         db.commit()
         response = pages.redirect(f"/c/verify?lang={language.value}")
         pages.write_flow(response, flow)
