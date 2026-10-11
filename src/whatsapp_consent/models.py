@@ -163,6 +163,8 @@ class Verification(ConsentBase):
     verified_at: Mapped[datetime | None] = _timestamp()
     # A consent page submission held until this verification succeeds (see submissions.hold_consent).
     pending: Mapped[dict[str, Any] | None] = mapped_column(JSONB(none_as_null=True))  # None is SQL NULL
+    # The `hold_id` of the held submission this row's completion applied (None if it applied nothing).
+    applied_hold_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
     created_at: Mapped[datetime] = _now()
 
 

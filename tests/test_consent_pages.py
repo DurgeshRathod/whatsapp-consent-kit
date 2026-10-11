@@ -705,3 +705,39 @@ def test_racing_typed_and_click_completions_apply_once(click_client, owner):
             text("SELECT count(*) FROM whatsapp_consent.verifications WHERE pending = 'null'::jsonb")
         ).scalar_one()
         assert json_nulls == 0  # cleared rows are SQL NULL, so `pending IS NULL` queries see them
+
+
+# Fix round 3: only the same submission applied through its sibling row is skipped; nothing else supersedes.
+
+
+def test_own_resubmit_after_a_click_completion_is_applied(click_client, owner):
+    _, headers = owner(whatsapp_number="+919800000001")
+    data = adult(name="Ravi", purposes=["service", "updates"], birthday_day="5")
+    subject_id, _ = add_subject(click_client, headers, display_name="Ravi", phone=data["phone"])
+    practice = practice_path(click_client, headers)
+    assert submit(click_client, practice, "me", data).status_code == 303
+    inbound_click(start_text_of(click_client), e164(data["phone"]))  # applied; the page was not refreshed
+    newer = data | {"purposes": ["service"], "birthday_day": "9"}
+    assert submit(click_client, practice, "me", newer).status_code == 303  # same flow, within a minute
+    res = enter_code(click_client, e164(data["phone"]))
+    assert res.status_code == 303 and res.headers["location"].startswith("/c/done")
+    info = detail(click_client, headers, subject_id)
+    assert (info["consents"], info["birthday_day"]) == ({"service": True, "updates": False}, 9)
+
+
+def test_a_late_cleared_click_row_does_not_drop_a_newer_flow(click_client, owner, relaxed_limits):
+    _, headers = owner(whatsapp_number="+919800000001")
+    data = adult(name="Ravi", purposes=["service", "updates"], birthday_day="5")
+    subject_id, _ = add_subject(click_client, headers, display_name="Ravi", phone=data["phone"])
+    practice = practice_path(click_client, headers)
+    assert submit(click_client, practice, "me", data).status_code == 303
+    first_click = start_text_of(click_client)
+    assert enter_code(click_client, e164(data["phone"])).status_code == 303
+    click_client.cookies.clear()
+    newer = data | {"purposes": ["service"], "birthday_day": "9"}
+    assert submit(click_client, practice, "me", newer).status_code == 303
+    inbound_click(first_click, e164(data["phone"]))  # the old, cleared click row arrives late
+    res = enter_code(click_client, e164(data["phone"]))
+    assert res.status_code == 303 and res.headers["location"].startswith("/c/done")
+    info = detail(click_client, headers, subject_id)
+    assert (info["consents"], info["birthday_day"]) == ({"service": True, "updates": False}, 9)

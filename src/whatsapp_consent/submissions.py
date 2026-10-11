@@ -74,8 +74,12 @@ class ConsentSubmission:
 def pending_payload(
     *, invite: Invite, submission: ConsentSubmission, notice: Notice, evidence: Evidence, key: str
 ) -> dict[str, Any]:
-    """What a verification row carries until it succeeds (deleted with the row after 2 days)."""
+    """What a verification row carries until it succeeds (deleted with the row after 2 days).
+
+    Each call is a new hold with a fresh `hold_id`; the typed and click rows of one submission share it.
+    """
     return {
+        "hold_id": str(uuid.uuid4()),
         "invite_id": str(invite.id),
         "submission": submission.to_pending(),
         "phone_fingerprint": phone_fingerprint(key, submission.phone),
@@ -136,6 +140,8 @@ def complete_consent_verification(db: Session, verification: Verification, now: 
     Applies the submission held on the row (if any). Raises `InviteAlreadyUsed` when its personal invite was
     completed meanwhile, and `LookupError` when the subject, invite or notice is gone or no longer matches.
     """
+    # Locks the subject with populate_existing, which reloads it from the database: a caller must flush its own
+    # edits to the subject before calling this, or they are discarded.
     now = now or datetime.now(UTC)
     # Completions for one subject run one at a time: lock the subject, then re-read this row's held submission
     # inside the lock, so a typed and a click-to-chat completion racing each other apply it at most once.
@@ -148,7 +154,7 @@ def complete_consent_verification(db: Session, verification: Verification, now: 
         raise LookupError("The verification's subject no longer exists")
     db.refresh(verification, with_for_update=True)
     held = verification.pending
-    if held is not None and _superseded(db, verification):
+    if held is not None and _already_applied(db, verification, held):
         verification.pending = held = None
     if held is None:
         if subject.phone_e164 != verification.phone_e164:
@@ -170,20 +176,20 @@ def complete_consent_verification(db: Session, verification: Verification, now: 
     return subject
 
 
-def _superseded(db: Session, verification: Verification) -> bool:
-    """Another consent submission for the subject was proven after this row was started."""
-    newer = db.scalar(
+def _already_applied(db: Session, verification: Verification, held: dict[str, Any]) -> bool:
+    """This very submission was already applied through its sibling row (the typed or the click-to-chat one)."""
+    hold_id = held.get("hold_id")
+    if hold_id is None:
+        return False
+    applied = db.scalar(
         select(Verification.id)
         .where(
             Verification.subject_id == verification.subject_id,
-            Verification.purpose == verification.purpose,
-            Verification.id != verification.id,
-            Verification.verified_at >= verification.created_at,
-            Verification.pending.is_(None),
+            Verification.applied_hold_id == uuid.UUID(hold_id),
         )
         .limit(1)
     )
-    return newer is not None
+    return applied is not None
 
 
 def _apply_held(db: Session, subject: Subject, verification: Verification, held: dict[str, Any], now: datetime) -> None:
@@ -235,7 +241,7 @@ def _apply_held(db: Session, subject: Subject, verification: Verification, held:
         now=now,
     )
     # A proven submission supersedes every other held one for the subject. A row locked by a completion running
-    # right now is skipped (waiting could deadlock); that completion sees it is superseded once it gets the lock.
+    # right now is skipped (waiting could deadlock); that completion finds this hold_id applied once it gets the lock.
     others = db.scalars(
         select(Verification)
         .where(
@@ -250,3 +256,4 @@ def _apply_held(db: Session, subject: Subject, verification: Verification, held:
     for row in others:
         row.pending = None
     verification.pending = None
+    verification.applied_hold_id = uuid.UUID(held["hold_id"])
