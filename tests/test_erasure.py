@@ -244,13 +244,98 @@ def test_erasing_an_owner(db, make_subject, owner_id):
 
     make_subject()
     make_subject(name="Ravi")
+    other = make_subject(owner=uuid.uuid4())
+    other_id = other.id
     assert erase_owner(db, owner_id) == 2
     assert count(db, Subject, Subject.owner_id == owner_id) == 0
+    assert db.get(Subject, other_id) is not None
 
 
-def test_maintenance_command_prints_counts(capsys):
+def test_maintenance_command_only_purges_by_default(capsys):
     from whatsapp_consent.cli import main
 
     main(["maintenance"])
     out = json.loads(capsys.readouterr().out)
-    assert {"unverified_signups_removed", "consent_events", "data_requests", "preference_links"} <= set(out)
+    assert {"consent_events", "data_requests", "preference_links"} <= set(out)
+    assert "unverified_signups_removed" not in out
+    main(["maintenance", "--cleanup-unverified-without-host-hook"])
+    out = json.loads(capsys.readouterr().out)
+    assert "unverified_signups_removed" in out
+
+
+def test_purge_keeps_events_while_the_erasure_request_is_within_retention(db, make_subject):
+    from whatsapp_consent.enums import DataRequestSource
+    from whatsapp_consent.erasure import erase_subject, purge
+    from whatsapp_consent.models import ConsentEvent
+
+    now = datetime.now(UTC)
+    fresh, stale = make_subject(), make_subject()
+    fresh_fp, stale_fp = fresh.phone_fingerprint, stale.phone_fingerprint
+    for subject, erased_days_ago in ((fresh, 1), (stale, 366)):
+        grant(db, subject, now=now - timedelta(days=400), service=True)
+        erase_subject(db, subject, source=DataRequestSource.SUBJECT, now=now - timedelta(days=erased_days_ago))
+    purge(db, retention_days=365, now=now)
+    kept = list(db.scalars(select(ConsentEvent.action).where(ConsentEvent.phone_fingerprint == fresh_fp)))
+    assert sorted(kept) == ["granted", "withdrawn"]
+    assert count(db, ConsentEvent, ConsentEvent.phone_fingerprint == stale_fp) == 0
+
+
+def test_cleanup_skips_signups_with_a_live_verification(db, make_subject):
+    from whatsapp_consent.enums import SubjectSource, VerificationMethod, VerificationPurpose
+    from whatsapp_consent.erasure import cleanup_unverified
+    from whatsapp_consent.models import Subject, Verification
+
+    now = datetime.now(UTC)
+    subject = make_subject(
+        source=SubjectSource.PRACTICE_LINK, verified=False, needs_review=True, created_at=now - timedelta(days=31)
+    )
+    subject_id = subject.id
+    db.add(
+        Verification(
+            subject_id=subject_id,
+            phone_e164=subject.phone_e164,
+            purpose=VerificationPurpose.CONSENT,
+            method=VerificationMethod.FAKE,
+            code_hash="x",
+            expires_at=now + timedelta(minutes=5),
+        )
+    )
+    db.flush()
+    assert cleanup_unverified(db, now=now) == 0
+    assert db.get(Subject, subject_id) is not None
+    assert cleanup_unverified(db, now=now + timedelta(minutes=6)) == 1
+
+
+def test_erasure_keeps_phone_only_verifications_while_another_owner_has_the_number(db, make_subject):
+    from whatsapp_consent.enums import DataRequestSource, VerificationMethod, VerificationPurpose
+    from whatsapp_consent.erasure import erase_subject
+    from whatsapp_consent.models import Verification
+
+    phone = random_phone()
+    mine, theirs = make_subject(phone=phone), make_subject(phone=phone, owner=uuid.uuid4())
+    del theirs
+    db.add(
+        Verification(
+            phone_e164=phone,
+            purpose=VerificationPurpose.PREFERENCES,
+            method=VerificationMethod.FAKE,
+            code_hash="x",
+            expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        )
+    )
+    db.flush()
+    erase_subject(db, mine, source=DataRequestSource.OWNER)
+    assert count(db, Verification, Verification.phone_e164 == phone) == 1
+
+
+def test_activity_is_per_owner(client, owner, kit):
+    from whatsapp_consent.enums import DataRequestSource
+
+    _, mine = owner()
+    _, theirs = owner()
+    mine_id, _ = add_subject(client, mine)
+    add_subject(client, theirs)
+    with committed_session() as db:
+        kit.erase_subject(db, uuid.UUID(mine_id), DataRequestSource.SUBJECT)
+    assert len(client.get("/subjects/activity", headers=mine).json()) == 1
+    assert client.get("/subjects/activity", headers=theirs).json() == []

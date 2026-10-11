@@ -153,7 +153,7 @@ def build_owner_router(kit: "ConsentKit", prefix: str) -> APIRouter:
                 DataRequest.source.in_((DataRequestSource.SUBJECT, DataRequestSource.SYSTEM)),
                 DataRequest.completed_at.is_not(None),
             )
-            .order_by(DataRequest.completed_at.desc())
+            .order_by(DataRequest.completed_at.desc(), DataRequest.id.desc())
             .limit(50)
         )
         return [

@@ -5,7 +5,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import Executable, and_, delete, func, or_, select, text
+from sqlalchemy import Executable, and_, delete, exists, func, or_, select, text
 from sqlalchemy.orm import Session
 
 from whatsapp_consent.enums import ConsentSource, DataRequestSource, InviteKind, SubjectSource
@@ -66,17 +66,13 @@ def erase_subject(
     subject_events = select(ConsentEvent.id).where(ConsentEvent.subject_id == subject_id)
     db.execute(delete(ConsentEvidence).where(ConsentEvidence.event_id.in_(subject_events)))
     # Verification rows can hold a held submission (raw IP and user agent in `pending`): none may outlive the person.
-    db.execute(
-        delete(Verification).where(
-            or_(
-                Verification.subject_id == subject_id,
-                and_(Verification.subject_id.is_(None), Verification.phone_e164 == phone),
-            )
-        )
-    )
+    db.execute(delete(Verification).where(Verification.subject_id == subject_id))
     db.expunge(subject)
     # ON DELETE SET NULL clears subject_id on consent_events and data_requests; consent_state and invites cascade.
     db.execute(delete(Subject).where(Subject.id == subject_id))
+    if not db.scalar(select(func.count()).select_from(Subject).where(Subject.phone_e164 == phone)):
+        # Phone-only rows (no subject) belong to nobody now, unless another owner's subject has the same number.
+        db.execute(delete(Verification).where(Verification.subject_id.is_(None), Verification.phone_e164 == phone))
     if not db.scalar(select(func.count()).select_from(Subject).where(Subject.phone_fingerprint == fingerprint)):
         revoke_preference_links(db, fingerprint, now)
     request.completed_at = now
@@ -116,6 +112,7 @@ def cleanup_unverified(db: Session, *, on_erased: ErasureHook | None = None, now
                 Subject.source == SubjectSource.PRACTICE_LINK,
                 Subject.phone_verified_at.is_(None),
                 Subject.created_at < now - UNVERIFIED_SIGNUP_TTL,
+                ~exists().where(Verification.subject_id == Subject.id, Verification.expires_at > now),
             )
         )
     )
@@ -140,8 +137,17 @@ def purge(db: Session, *, retention_days: int, now: datetime | None = None) -> P
     now = now or datetime.now(UTC)
     cutoff = now - timedelta(days=retention_days)
     db.execute(text("SELECT set_config('whatsapp_consent.allow_purge', 'on', true)"))
+    # An event stays while the erasure request that anonymised it is itself within the retention period.
+    recent_request = exists().where(
+        DataRequest.owner_id == ConsentEvent.owner_id,
+        DataRequest.phone_fingerprint == ConsentEvent.phone_fingerprint,
+        DataRequest.completed_at >= cutoff,
+    )
     events = _deleted(
-        db, delete(ConsentEvent).where(ConsentEvent.subject_id.is_(None), ConsentEvent.occurred_at < cutoff)
+        db,
+        delete(ConsentEvent).where(
+            ConsentEvent.subject_id.is_(None), ConsentEvent.occurred_at < cutoff, ~recent_request
+        ),
     )
     requests = _deleted(
         db, delete(DataRequest).where(DataRequest.subject_id.is_(None), DataRequest.completed_at < cutoff)
@@ -173,3 +179,7 @@ def run_maintenance(
     now = now or datetime.now(UTC)
     removed = cleanup_unverified(db, on_erased=on_erased, now=now)
     return {"unverified_signups_removed": removed} | asdict(purge(db, retention_days=retention_days, now=now))
+
+
+def run_purge_only(db: Session, *, retention_days: int, now: datetime | None = None) -> dict[str, int]:
+    return asdict(purge(db, retention_days=retention_days, now=now))

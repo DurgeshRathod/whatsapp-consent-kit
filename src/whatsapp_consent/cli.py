@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from whatsapp_consent.config import ConsentSettings, DatabaseUrlSettings
 from whatsapp_consent.db import SCHEMA
-from whatsapp_consent.erasure import run_maintenance
+from whatsapp_consent.erasure import cleanup_unverified, run_purge_only
 from whatsapp_consent.migrations import migrate
 
 
@@ -16,10 +16,15 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="whatsapp-consent")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("migrate", help="apply the kit's database migrations (schema whatsapp_consent)")
-    commands.add_parser(
+    maintenance = commands.add_parser(
         "maintenance",
-        help="erase stale sign-ups and purge expired anonymised records (inside a host, prefer kit.run_maintenance, "
-        "which also calls the host's erasure hook)",
+        help="purge expired anonymised records. A host with an erasure hook must call kit.run_maintenance(db) "
+        "instead: this command cannot call the hook, so it does not erase stale sign-ups unless told to",
+    )
+    maintenance.add_argument(
+        "--cleanup-unverified-without-host-hook",
+        action="store_true",
+        help="also erase stale unverified practice-link sign-ups, WITHOUT calling any host erasure hook",
     )
     args = parser.parse_args(argv)
     url = DatabaseUrlSettings().url()
@@ -30,10 +35,15 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "maintenance":
         settings = ConsentSettings()  # pyright: ignore[reportCallIssue]
         engine = create_engine(url)
-        with Session(engine) as db:
-            result = run_maintenance(db, retention_days=settings.retention_days)
-            db.commit()
-        engine.dispose()
+        try:
+            with Session(engine) as db:
+                result: dict[str, int] = {}
+                if args.cleanup_unverified_without_host_hook:
+                    result["unverified_signups_removed"] = cleanup_unverified(db)
+                result |= run_purge_only(db, retention_days=settings.retention_days)
+                db.commit()
+        finally:
+            engine.dispose()
         print(json.dumps(result))
 
 
