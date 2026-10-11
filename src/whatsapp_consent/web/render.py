@@ -8,7 +8,7 @@ from urllib.parse import urlencode
 
 from fastapi import Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
-from itsdangerous import BadSignature, URLSafeTimedSerializer
+from itsdangerous import BadData, URLSafeTimedSerializer
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from whatsapp_consent.config import ConsentSettings
@@ -85,7 +85,8 @@ class Pages:
         cookie = request.cookies.get(CSRF_COOKIE)
         if not cookie or not submitted:
             return False
-        return hmac.compare_digest(cookie, submitted)
+        # Bytes, not str: compare_digest raises TypeError on non-ASCII str, and a submitted value is untrusted.
+        return hmac.compare_digest(cookie.encode(), submitted.encode())
 
     def message(
         self,
@@ -141,7 +142,7 @@ class Pages:
             return None
         try:
             return self._flow.loads(raw, max_age=FLOW_MAX_AGE)
-        except BadSignature:  # includes SignatureExpired
+        except BadData:  # bad signature, expired, or a malformed payload
             return None
 
     def clear_flow(self, response: Response) -> None:

@@ -1,7 +1,17 @@
 import html
 import re
+import time
 from string import Formatter
+from types import SimpleNamespace
 from typing import get_args
+
+import itsdangerous.timed
+import pytest
+from starlette.requests import Request
+from starlette.responses import Response
+
+from whatsapp_consent.enums import Language
+from whatsapp_consent.web.render import CSRF_COOKIE, FLOW_COOKIE, FLOW_MAX_AGE, Pages
 
 DEVANAGARI = re.compile(r"[ऀ-ॿ]")
 
@@ -85,3 +95,98 @@ def test_every_verification_error_has_a_message():
 
     for reason in get_args(Reason):
         assert f"err_{reason}" in STRINGS, reason
+
+
+def _request(cookies: dict[str, str] | None = None, method: str = "GET") -> Request:
+    headers = []
+    if cookies:
+        headers.append((b"cookie", "; ".join(f"{k}={v}" for k, v in cookies.items()).encode()))
+    return Request(
+        {
+            "type": "http",
+            "method": method,
+            "path": "/",
+            "query_string": b"",
+            "headers": headers,
+            "scheme": "http",
+            "server": ("testserver", 80),
+        }
+    )
+
+
+def _set_cookie(response: Response, name: str) -> str:
+    for header in response.headers.getlist("set-cookie"):
+        if header.startswith(f"{name}="):
+            return header
+    raise AssertionError(f"no {name} cookie was set")
+
+
+def _cookie_value(header: str) -> str:
+    return header.split(";")[0].split("=", 1)[1]
+
+
+@pytest.fixture
+def pages(kit):
+    return Pages(kit.settings)
+
+
+def test_csrf_accepts_only_the_matching_token(pages):
+    assert pages.csrf_ok(_request({CSRF_COOKIE: "tok"}), "tok") is True
+    assert pages.csrf_ok(_request({CSRF_COOKIE: "tok"}), "other") is False
+    assert pages.csrf_ok(_request(), "tok") is False
+    assert pages.csrf_ok(_request({CSRF_COOKIE: "tok"}), "") is False
+
+
+def test_csrf_with_non_ascii_submission_is_refused_without_error(pages):
+    assert pages.csrf_ok(_request({CSRF_COOKIE: "tok"}), "tökén") is False
+
+
+def test_flow_round_trips_through_the_cookie(pages):
+    response = Response()
+    pages.write_flow(response, {"l": "hi", "s": "abc"})
+    request = _request({FLOW_COOKIE: _cookie_value(_set_cookie(response, FLOW_COOKIE))})
+    assert pages.read_flow(request) == {"l": "hi", "s": "abc"}
+
+
+def test_tampered_flow_cookie_reads_as_none(pages):
+    response = Response()
+    pages.write_flow(response, {"l": "en"})
+    value = _cookie_value(_set_cookie(response, FLOW_COOKIE))
+    tampered = value[:-1] + ("A" if value[-1] != "A" else "B")
+    assert pages.read_flow(_request({FLOW_COOKIE: tampered})) is None
+
+
+def test_expired_flow_cookie_reads_as_none(pages, monkeypatch):
+    response = Response()
+    pages.write_flow(response, {"l": "en"})
+    value = _cookie_value(_set_cookie(response, FLOW_COOKIE))
+    later = time.time() + FLOW_MAX_AGE + 60
+    monkeypatch.setattr(itsdangerous.timed, "time", SimpleNamespace(time=lambda: later))
+    assert pages.read_flow(_request({FLOW_COOKIE: value})) is None
+
+
+def test_form_and_flow_cookies_are_httponly(pages):
+    form = pages.form(_request(), "message.html", Language.EN, title="x")
+    assert "httponly" in _set_cookie(form, CSRF_COOKIE).lower()
+    response = Response()
+    pages.write_flow(response, {"l": "en"})
+    assert "httponly" in _set_cookie(response, FLOW_COOKIE).lower()
+
+
+def test_cookies_are_secure_only_on_https(kit):
+    https = Pages(kit.settings.model_copy(update={"public_base_url": "https://consent.example"}))
+    flow = Response()
+    https.write_flow(flow, {"l": "en"})
+    assert "; secure" in _set_cookie(flow, FLOW_COOKIE).lower()
+    form = https.form(_request(), "message.html", Language.EN, title="x")
+    assert "; secure" in _set_cookie(form, CSRF_COOKIE).lower()
+
+    http_flow = Response()
+    Pages(kit.settings).write_flow(http_flow, {"l": "en"})
+    assert "; secure" not in _set_cookie(http_flow, FLOW_COOKIE).lower()
+
+
+@pytest.mark.parametrize("path", ["/notice/abc", "/notice/99999999999", "/notice/%D9%A1", "/notice/0"])
+def test_malformed_notice_versions_are_friendly_404(client, path):
+    res = client.get(path)
+    assert res.status_code == 404 and "<h1>" in res.text

@@ -24,13 +24,16 @@ def build(kit: "ConsentKit", pages: Pages) -> APIRouter:
 
     @router.get("/notice/{version}", response_class=HTMLResponse)
     def notice_page(
-        version: int,
+        version: str,
         request: Request,
         db: Annotated[Session, Depends(kit.session_dependency)],
         lang: str | None = None,
     ) -> HTMLResponse:
         language = pick_lang(lang, Language.EN)
-        notice = db.scalar(select(Notice).where(Notice.version == version, Notice.language == language))
+        notice = None
+        # Anything that is not a short run of ASCII digits is simply an unknown notice.
+        if version.isascii() and version.isdigit() and len(version) <= 6:
+            notice = db.scalar(select(Notice).where(Notice.version == int(version), Notice.language == language))
         if notice is None:
             return pages.message(
                 request, language, title_key="not_found_title", body_key="not_found_body", status_code=404
