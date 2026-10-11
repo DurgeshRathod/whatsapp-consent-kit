@@ -137,10 +137,19 @@ def complete_consent_verification(db: Session, verification: Verification, now: 
     completed meanwhile, and `LookupError` when the subject, invite or notice is gone or no longer matches.
     """
     now = now or datetime.now(UTC)
-    subject = db.get(Subject, verification.subject_id) if verification.subject_id else None
+    # Completions for one subject run one at a time: lock the subject, then re-read this row's held submission
+    # inside the lock, so a typed and a click-to-chat completion racing each other apply it at most once.
+    subject = (
+        db.get(Subject, verification.subject_id, with_for_update=True, populate_existing=True)
+        if verification.subject_id
+        else None
+    )
     if subject is None:
         raise LookupError("The verification's subject no longer exists")
+    db.refresh(verification, with_for_update=True)
     held = verification.pending
+    if held is not None and _superseded(db, verification):
+        verification.pending = held = None
     if held is None:
         if subject.phone_e164 != verification.phone_e164:
             raise LookupError("The verified number is not the subject's number")
@@ -159,6 +168,22 @@ def complete_consent_verification(db: Session, verification: Verification, now: 
     )
     db.flush()
     return subject
+
+
+def _superseded(db: Session, verification: Verification) -> bool:
+    """Another consent submission for the subject was proven after this row was started."""
+    newer = db.scalar(
+        select(Verification.id)
+        .where(
+            Verification.subject_id == verification.subject_id,
+            Verification.purpose == verification.purpose,
+            Verification.id != verification.id,
+            Verification.verified_at >= verification.created_at,
+            Verification.pending.is_(None),
+        )
+        .limit(1)
+    )
+    return newer is not None
 
 
 def _apply_held(db: Session, subject: Subject, verification: Verification, held: dict[str, Any], now: datetime) -> None:
@@ -209,15 +234,19 @@ def _apply_held(db: Session, subject: Subject, verification: Verification, held:
         evidence=Evidence(held.get("ip"), held.get("user_agent")),
         now=now,
     )
-    # The typed and click-to-chat rows started together hold the same submission: apply it once.
-    siblings = db.scalars(
-        select(Verification).where(
+    # A proven submission supersedes every other held one for the subject. A row locked by a completion running
+    # right now is skipped (waiting could deadlock); that completion sees it is superseded once it gets the lock.
+    others = db.scalars(
+        select(Verification)
+        .where(
             Verification.subject_id == subject.id,
+            Verification.purpose == verification.purpose,
+            Verification.id != verification.id,
             Verification.verified_at.is_(None),
             Verification.pending.is_not(None),
         )
+        .with_for_update(skip_locked=True)
     )
-    for row in siblings:
-        if row.pending == held:
-            row.pending = None
+    for row in others:
+        row.pending = None
     verification.pending = None

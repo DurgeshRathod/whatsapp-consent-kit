@@ -162,7 +162,7 @@ class Verification(ConsentBase):
     expires_at: Mapped[datetime] = _timestamp()
     verified_at: Mapped[datetime | None] = _timestamp()
     # A consent page submission held until this verification succeeds (see submissions.hold_consent).
-    pending: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    pending: Mapped[dict[str, Any] | None] = mapped_column(JSONB(none_as_null=True))  # None is SQL NULL
     created_at: Mapped[datetime] = _now()
 
 

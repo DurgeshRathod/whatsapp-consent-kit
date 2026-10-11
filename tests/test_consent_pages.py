@@ -20,6 +20,8 @@ from helpers import (
 )
 from sqlalchemy import select, text
 
+from whatsapp_consent.web.render import FLOW_COOKIE
+
 
 def detail(client, headers, subject_id):
     return client.get(f"/subjects/{subject_id}", headers=headers).json()
@@ -67,16 +69,27 @@ def test_personal_link_is_prefilled(client, owner):
 
 
 def test_year_of_birth_is_not_stored(client, owner, engine):
+    """Deterministic: random phones, ids and hex fingerprints may contain the digits, so check columns by role."""
     _, headers = owner()
     subject_id, path = add_subject(client, headers)
-    consent_and_verify(client, path, data=adult(birth_year="1987"))
+    data = adult(birth_year="1987")
+    assert submit(client, path, "me", data).status_code == 303
+    with engine.connect() as conn:
+        held = conn.execute(
+            text("SELECT pending FROM whatsapp_consent.verifications WHERE subject_id = :id"), {"id": subject_id}
+        ).scalar_one()
+    assert "birth_year" not in held["submission"] and 1987 not in held["submission"].values()
+    assert enter_code(client, e164(data["phone"])).status_code == 303
     with engine.connect() as conn:
         row = (
             conn.execute(text("SELECT * FROM whatsapp_consent.subjects WHERE id = :id"), {"id": subject_id})
             .mappings()
             .one()
         )
-    assert "1987" not in " ".join(str(value) for value in row.values())
+    assert not any("year" in column for column in row)
+    assert all(value not in (1987, "1987") for value in row.values())
+    assert (row["birthday_day"], row["birthday_month"]) == (12, 3)
+    assert all("1987" not in (row[column] or "") for column in ("display_name", "guardian_name", "guardian_relation"))
 
 
 def test_practice_link_signups_wait_for_review(client, owner):
@@ -431,7 +444,6 @@ def test_practice_link_cannot_take_over_a_verified_subject(client, owner, relaxe
 
 def test_replayed_flow_cookie_verifies_only_its_own_submission(client, owner, relaxed_limits):
     from whatsapp_consent.models import Subject
-    from whatsapp_consent.web.render import FLOW_COOKIE
 
     _, headers = owner()
     subject_id, path = add_subject(client, headers)
@@ -527,3 +539,169 @@ def test_click_to_chat_end_to_end_applies_once(click_client, owner):
     with committed_session() as db:
         rows = db.scalars(select(Verification).where(Verification.subject_id == uuid.UUID(subject_id))).all()
         assert all(row.pending is None for row in rows)
+
+
+# Fix round 2: only the caller's own flow may replace a held submission; a proven one supersedes the rest.
+
+
+def test_stranger_within_a_minute_cannot_replace_a_held_submission(client, owner):
+    _, headers = owner()
+    data = adult(name="Asha", purposes=["service", "updates"])
+    subject_id, _ = add_subject(client, headers, phone=data["phone"])
+    practice = practice_path(client, headers)
+    assert submit(client, practice, "me", data).status_code == 303
+    victim = client.cookies.get(FLOW_COOKIE)
+    client.cookies.clear()
+    stranger = guardian(child_name="Asha", phone=data["phone"], guardian_name="Stranger", purposes=["service"])
+    res = submit(client, practice, "child", stranger)
+    assert res.status_code == 429 and "Please wait a minute" in text_of(res)
+    client.cookies.clear()
+    client.cookies.set(FLOW_COOKIE, victim)
+    assert enter_code(client, e164(data["phone"])).status_code == 303
+    info = detail(client, headers, subject_id)
+    assert (info["is_minor"], info["guardian_name"]) == (False, None)
+    assert info["consents"] == {"service": True, "updates": True}
+
+
+def test_same_flow_double_submit_replaces_its_own_held_submission(click_client, owner):
+    _, headers = owner(whatsapp_number="+919800000001")
+    data = adult(name="Ravi", purposes=["service", "updates"])
+    subject_id, path = add_subject(click_client, headers, display_name="Ravi", phone=data["phone"])
+    assert submit(click_client, path, "me", data).status_code == 303
+    first_click = start_text_of(click_client)
+    assert submit(click_client, path, "me", data | {"purposes": ["service"]}).status_code == 303
+    assert start_text_of(click_client) == first_click  # the same flow's rows are reused
+    inbound_click(first_click, e164(data["phone"]))
+    assert detail(click_client, headers, subject_id)["consents"] == {"service": True, "updates": False}
+
+
+def test_a_stale_click_row_completed_later_does_not_overwrite_newer_data(click_client, owner, relaxed_limits):
+    _, headers = owner(whatsapp_number="+919800000001")
+    data = adult(name="Ravi", purposes=["service", "updates"])
+    subject_id, _ = add_subject(click_client, headers, display_name="Ravi", phone=data["phone"])
+    practice = practice_path(click_client, headers)
+    assert submit(click_client, practice, "me", data).status_code == 303
+    stale_click = start_text_of(click_client)
+    click_client.cookies.clear()
+    newer = data | {"purposes": ["service"], "birthday_day": "2"}
+    assert submit(click_client, practice, "me", newer).status_code == 303
+    assert enter_code(click_client, e164(data["phone"])).status_code == 303
+    applied = detail(click_client, headers, subject_id)
+    inbound_click(stale_click, e164(data["phone"]))
+    info = detail(click_client, headers, subject_id)
+    assert (info["consents"], info["birthday_day"]) == ({"service": True, "updates": False}, 2)
+    assert len(info["history"]) == len(applied["history"])
+
+
+def test_personal_invite_revoked_between_hold_and_completion(client, owner, relaxed_limits):
+    _, headers = owner()
+    subject_id, path = add_subject(client, headers, display_name="Zed")
+    data = adult(name="Zed Changed")
+    assert submit(client, path, "me", data).status_code == 303
+    with committed_session() as db:
+        db.execute(
+            text("UPDATE whatsapp_consent.invites SET revoked_at = now() WHERE subject_id = :s"), {"s": subject_id}
+        )
+    assert enter_code(client, e164(data["phone"])).status_code == 410
+    info = detail(client, headers, subject_id)
+    assert (info["display_name"], info["status"], info["history"]) == ("Zed", "invited", [])
+
+
+def test_subject_marked_minor_between_adult_hold_and_completion(client, owner, relaxed_limits):
+    _, headers = owner()
+    data = adult(name="Kabir")
+    subject_id, path = add_subject(client, headers, display_name="Kabir", phone=data["phone"])
+    consent_and_verify(client, path, data=data)
+    client.cookies.clear()
+    assert submit(client, practice_path(client, headers), "me", data | {"purposes": ["service"]}).status_code == 303
+    client.post(f"/subjects/{subject_id}/mark-minor", headers=headers)
+    before = detail(client, headers, subject_id)
+    res = enter_code(client, e164(data["phone"]))
+    assert not (res.status_code == 303 and res.headers["location"].startswith("/c/done"))
+    info = detail(client, headers, subject_id)
+    assert (info["is_minor"], info["minor_suspended"], info["guardian_name"]) == (True, True, None)
+    assert info["consents"] == before["consents"] and len(info["history"]) == len(before["history"])
+
+
+def test_typed_then_click_completion_applies_once(click_client, owner):
+    _, headers = owner(whatsapp_number="+919800000001")
+    subject_id, path = add_subject(click_client, headers)
+    data = adult()
+    assert submit(click_client, path, "me", data).status_code == 303
+    click = start_text_of(click_client)
+    assert enter_code(click_client, e164(data["phone"])).status_code == 303
+    history = len(detail(click_client, headers, subject_id)["history"])
+    inbound_click(click, e164(data["phone"]))
+    assert len(detail(click_client, headers, subject_id)["history"]) == history == 2
+
+
+def test_racing_typed_and_click_completions_apply_once(click_client, owner):
+    """The inbound handler holds the click row while the typed code completes; the payload applies once."""
+    import threading
+
+    import example_host
+
+    from whatsapp_consent.config import ConsentSettings
+    from whatsapp_consent.enums import VerificationMethod, VerificationPurpose
+    from whatsapp_consent.models import Verification
+    from whatsapp_consent.senders import fake_sender
+    from whatsapp_consent.submissions import complete_consent_verification
+    from whatsapp_consent.verification import check_code, verify_click_code
+
+    key = ConsentSettings().fingerprint_key  # pyright: ignore[reportCallIssue]
+    _, headers = owner(whatsapp_number="+919800000001")
+    subject_id, path = add_subject(click_client, headers)
+    data = adult()
+    phone = e164(data["phone"])
+    assert submit(click_client, path, "me", data).status_code == 303
+    click = start_text_of(click_client)
+    with committed_session() as db:
+        typed_id = db.scalar(
+            select(Verification.id).where(
+                Verification.subject_id == uuid.UUID(subject_id),
+                Verification.method != VerificationMethod.CLICK_TO_CHAT,
+            )
+        )
+    assert typed_id is not None
+    locked, go, errors = threading.Event(), threading.Event(), []
+
+    def inbound() -> None:
+        try:
+            with example_host.session() as db:
+                verification = verify_click_code(db, phone=phone, code=click.removeprefix("START-"), key=key)
+                assert verification is not None
+                locked.set()  # the click row is now locked by this transaction
+                assert go.wait(10)
+                complete_consent_verification(db, verification)
+                db.commit()
+        except Exception as error:  # surfaced below
+            errors.append(error)
+            locked.set()
+
+    thread = threading.Thread(target=inbound)
+    thread.start()
+    assert locked.wait(10)
+    try:
+        with example_host.session() as db:
+            db.execute(text("SET LOCAL lock_timeout = '2s'"))
+            typed = check_code(
+                db,
+                verification_id=typed_id,
+                purpose=VerificationPurpose.CONSENT,
+                code=fake_sender.last_code(phone),
+                key=key,
+            )
+            complete_consent_verification(db, typed)
+            db.commit()
+    finally:
+        go.set()
+        thread.join(10)
+    assert not errors, errors
+    assert len(detail(click_client, headers, subject_id)["history"]) == 2
+    with committed_session() as db:
+        rows = db.scalars(select(Verification).where(Verification.subject_id == uuid.UUID(subject_id))).all()
+        assert all(row.pending is None for row in rows)
+        json_nulls = db.execute(
+            text("SELECT count(*) FROM whatsapp_consent.verifications WHERE pending = 'null'::jsonb")
+        ).scalar_one()
+        assert json_nulls == 0  # cleared rows are SQL NULL, so `pending IS NULL` queries see them

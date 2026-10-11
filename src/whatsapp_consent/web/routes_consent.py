@@ -393,6 +393,8 @@ def build(kit: "ConsentKit", pages: Pages) -> APIRouter:
             db.rollback()
             return pages.invalid_link(request, language)
         held = pending_payload(invite=invite, submission=submission, notice=notice, evidence=evidence, key=kit.key)
+        previous_flow = pages.read_flow(request)
+        own_click = None
 
         try:
             verification = start_code_verification(
@@ -406,23 +408,37 @@ def build(kit: "ConsentKit", pages: Pages) -> APIRouter:
                 pending=held,
             )
         except VerificationError as error:
+            # A double submit may replace its own held submission, never anyone else's: reuse the pending code
+            # only when it is the one this browser's flow started.
+            own = flow_row(db, previous_flow, "v") if previous_flow else None
             reused = None
-            if error.reason == "too_soon":
+            if error.reason == "too_soon" and own is not None:
                 reused = latest_pending(
                     db, phone=submission.phone, purpose=VerificationPurpose.CONSENT, subject_id=subject.id
                 )
-            if reused is None:
+            if reused is None or own is None or reused.id != own.id:
                 db.rollback()  # nothing is kept for a number we can't verify right now
                 return again([f"err_{error.reason}"], 429 if error.reason in ("too_soon", "rate_limited") else 422)
-            reused.pending = held  # the latest submission is the one the code will confirm
+            reused.pending = held
             verification = reused
+            own_click = flow_row(db, previous_flow, "cv") if previous_flow else None
 
         flow = {"v": str(verification.id), "s": str(subject.id), "l": language.value}
         if settings.click_to_chat and info.whatsapp_number:
-            click, click_text = start_click_verification(
-                db, phone=submission.phone, subject_id=subject.id, key=kit.key, pending=held
-            )
-            flow |= {"cv": str(click.id), "c": click_text}
+            if (
+                own_click is not None
+                and own_click.method == VerificationMethod.CLICK_TO_CHAT
+                and own_click.verified_at is None
+                and previous_flow
+                and previous_flow.get("c")
+            ):
+                own_click.pending = held  # the same flow's click row confirms the same, latest submission
+                flow |= {"cv": str(own_click.id), "c": previous_flow["c"]}
+            else:
+                click, click_text = start_click_verification(
+                    db, phone=submission.phone, subject_id=subject.id, key=kit.key, pending=held
+                )
+                flow |= {"cv": str(click.id), "c": click_text}
         db.commit()
         response = pages.redirect(f"/c/verify?lang={language.value}")
         pages.write_flow(response, flow)
