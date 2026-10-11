@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ t('done_title') }}</h1>
+<p>{{ t('done_intro', business=business) }}</p>
+<p>{{ t('save_number', business=business) }}</p>
+<a class="button" href="{{ manage_url }}">{{ t('manage_link') }}</a>
+<p class="hint">{{ t('manage_hint') }}</p>
+<p class="link-text muted">{{ manage_url }}</p>
+{% endblock %}

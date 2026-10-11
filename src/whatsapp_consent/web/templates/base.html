@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="{{ lang }}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>{{ title or t('page_title_consent') }}</title>
+<link rel="stylesheet" href="/consent-static/consent.css">
+</head>
+<body>
+<main class="card">
+{% if lang_switch_url %}
+<nav class="lang"><a href="{{ lang_switch_url }}" lang="{{ other_lang }}" hreflang="{{ other_lang }}">{{ other_lang_name }}</a></nav>
+{% endif %}
+{% block content %}{% endblock %}
+</main>
+<footer>{{ t('footer') }}</footer>
+</body>
+</html>

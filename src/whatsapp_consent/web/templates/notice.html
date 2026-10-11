@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ notice.title }}</h1>
+<p class="muted">{{ t('notice_version', version=notice.version, date=notice.effective_from.isoformat()) }}</p>
+<p><strong>{{ notice.summary }}</strong></p>
+{% for paragraph in paragraphs %}
+<p>{{ paragraph }}</p>
+{% endfor %}
+{% endblock %}

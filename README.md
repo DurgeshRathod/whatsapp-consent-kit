@@ -12,9 +12,9 @@ and Meta's WhatsApp opt-in rules.
 The kit stores no health data and never stores inbound message text. It never sends messages: you send codes through
 your own sender and act on the outcomes it returns.
 
-> **Status:** v0.1.0 is in development on the
-> [`feat/v0.1.0`](https://github.com/DurgeshRathod/whatsapp-consent-kit/tree/feat/v0.1.0) branch. The design is in
-> [`docs/specs`](docs/specs/2026-10-11-whatsapp-consent-kit-design.md) and the build plan in [`docs/plans`](docs/plans).
+> **Status:** v0.1.0. The design is in [`docs/specs`](docs/specs/2026-10-11-whatsapp-consent-kit-design.md) and the
+> build plan in [`docs/plans`](docs/plans). Before production, confirm Meta's marketing opt-out error code (131050) and
+> the click-to-chat inbound format with a real test number.
 
 ## How consent works
 
@@ -108,6 +108,22 @@ app.include_router(kit.owner_router(prefix="/clients"))
 app.include_router(kit.public_router())
 ```
 
+A sender is any class with a `method` and `send_code`:
+
+```python
+from whatsapp_consent import Language
+from whatsapp_consent.enums import VerificationMethod
+from whatsapp_consent.senders import VerificationSender
+
+class QueuedTemplateSender:
+    method = VerificationMethod.AUTHENTICATION_TEMPLATE
+
+    def send_code(self, phone_e164: str, code: str, language: Language) -> None:
+        queue.enqueue(send_authentication_template, phone_e164, code, language.value)  # returns at once
+
+my_authentication_template_sender: VerificationSender = QueuedTemplateSender()
+```
+
 Your sender's `send_code` runs inside the request. Keep it fast (queue the WhatsApp call) so a page's response time
 doesn't depend on whether a code was really sent: the preferences lookup gives the same answer for registered and
 unregistered numbers, and timing is part of that answer.
@@ -125,16 +141,39 @@ kit.audit_by_phone(db, owner_id, "+919876543210")
 ## WhatsApp webhook
 
 ```python
+from whatsapp_consent.meta import InvalidSignature, InvalidWebhookPayload
+
+
 @app.post("/webhooks/whatsapp")
 async def webhook(request: Request, db: Session = Depends(get_db)):
-    events = kit.parse_webhook(await request.body(), request.headers.get("X-Hub-Signature-256"))
-    for owner_id, owner_events in group_by_owner(events):   # map phone_number_id -> owner
-        for outcome in kit.handle_inbound(db, owner_id, owner_events):
+    try:
+        events = kit.parse_webhook(await request.body(), request.headers.get("X-Hub-Signature-256"))
+    except InvalidSignature:
+        raise HTTPException(403)
+    except InvalidWebhookPayload:
+        raise HTTPException(400)
+    by_number: dict[str, list] = {}
+    for event in events:
+        by_number.setdefault(event.phone_number_id, []).append(event)
+    for phone_number_id, number_events in by_number.items():
+        owner_id = owner_for_number(phone_number_id)   # your mapping; skip numbers you don't know
+        for outcome in kit.handle_inbound(db, owner_id, number_events):  # one phone_number_id per call
             ...  # e.g. reply with outcome.preferences_url inside the 24-hour window
     db.commit()
 ```
 
-Add `whatsapp_consent.messages.opt_out_footer(...)` and `stop_button(...)` to marketing templates.
+Add `whatsapp_consent.messages.opt_out_footer(...)` and `stop_button(...)` to marketing templates. When you send
+one, pass the matching payload parameter with the send, or a tap arrives as plain text and is ignored:
+
+```python
+from whatsapp_consent.messages import manage_button_parameter, stop_button_parameter
+
+components = [
+    # ...body parameters...
+    stop_button_parameter("updates", index=0),   # the purpose this message was sent under
+    manage_button_parameter(index=1),            # only if the template has a manage button
+]
+```
 
 ## Daily maintenance
 
@@ -144,12 +183,96 @@ Call `kit.run_maintenance(db)` from a scheduled job. It erases unverified practi
 `uv run whatsapp-consent maintenance` runs only the purge, because a CLI can't call your hook. Hosts without an erasure
 hook can add `--cleanup-unverified-without-host-hook`.
 
+## Reference
+
+### Owner API — `kit.owner_router(prefix="/clients")`
+
+Every route runs `owner_dependency` (your auth) and only ever sees that owner's subjects; another owner's id is a 404.
+Paths below are relative to the prefix.
+
+| Method | Path | Body / query | Returns |
+|---|---|---|---|
+| `POST` | `` | `NewSubjectIn` `{display_name, phone, birthday_day?, birthday_month?, is_minor?}` | `201` `NewSubjectOut` `{subject, invite}` |
+| `GET` | `` | `?status=` a `SubjectStatus` (optional) | `list[SubjectOut]` |
+| `GET` | `/status` | `?phone=` any format | `list[SubjectOut]` for that number (422 if not a number) |
+| `GET` | `/sendable` | `?purpose=` | `SendableOut` `{purpose, count, subject_ids}` |
+| `GET` | `/practice-link` | | `PracticeLinkOut` `{link, qr_svg}` |
+| `POST` | `/practice-link/rotate` | | `PracticeLinkOut` (old link stops working) |
+| `GET` | `/activity` | | `list[ActivityOut]` `{kind, occurred_at}`: erasures by the person and stale sign-ups removed |
+| `GET` | `/{subject_id}` | | `SubjectDetailOut`: `SubjectOut` + `history` |
+| `POST` | `/{subject_id}/invite` | | `ShareLinkOut` `{link, share_message, whatsapp_url}`: a fresh personal link (earlier ones stop working) |
+| `POST` | `/{subject_id}/approve` | | `SubjectOut`: clears `needs_review` on a practice-link sign-up |
+| `POST` | `/{subject_id}/withdraw` | `WithdrawIn` `{purpose}` | `SubjectOut`: records a withdrawal the person told you about |
+| `POST` | `/{subject_id}/mark-minor` | | `ShareLinkOut`: suspends the subject; send the link to a parent or guardian |
+| `DELETE` | `/{subject_id}` | | `204`: erases the person (calls your hook) |
+
+`SubjectOut`: `id, display_name, phone, birthday_day, birthday_month, is_minor, guardian_name, guardian_relation,
+source, status, verified, needs_review, minor_suspended, consents, can_send, blockers, created_at`.
+`status` is one of `needs_review, suspended, invited, unverified, active, withdrawn`; `blockers[purpose]` lists any of
+`no_consent, unverified, needs_review, minor_suspended`.
+
+### Public pages — `kit.public_router()`
+
+Server-rendered HTML in English or Hindi (`?lang=en|hi`), no JavaScript, CSRF on every form, strict CSP. Mount at the
+root of the domain in `CONSENT_PUBLIC_BASE_URL`.
+
+| Method | Path | What it is |
+|---|---|---|
+| `GET` | `/c/{token}` | consent page for a personal or practice link ("for me" / "for my child") |
+| `POST` | `/c/{token}` | submits the form; holds it and sends a code |
+| `GET`, `POST` | `/c/verify` | enter the code |
+| `POST` | `/c/verify/check` | "I've sent the WhatsApp message" (click-to-chat) |
+| `POST` | `/c/verify/resend` | send a new code |
+| `GET` | `/c/done` | confirmation with the person's private preferences link |
+| `GET`, `POST` | `/p` | find my preferences by number (same answer whether or not it's registered) |
+| `GET`, `POST` | `/p/verify` | enter the code; leads to `/p/{token}` |
+| `GET` | `/p/{token}` | manage each business's purposes |
+| `POST` | `/p/{token}/subjects/{subject_id}` | save choices for one business |
+| `POST` | `/p/{token}/delete` | start "delete my data" (one business or all); sends a code |
+| `GET` | `/p/{token}/delete` | enter the deletion code |
+| `POST` | `/p/{token}/delete/confirm` | erase |
+| `GET` | `/notice/{version}` | a privacy notice version |
+| `GET` | `/consent-static/consent.css` | the pages' stylesheet |
+
+### Python API — `ConsentKit`
+
+| Call | Returns |
+|---|---|
+| `kit.status(db, subject_id)` | `SubjectState \| None`: status, verified, consents, blockers, last change, notice version and language |
+| `kit.status_by_phone(db, owner_id, phone)` | `list[SubjectState]` |
+| `kit.can_send(db, subject_id, purpose)` | `bool` |
+| `kit.can_send_category(db, subject_id, TemplateCategory)` | `bool` for a Meta template category |
+| `kit.sendable_subjects(db, owner_id, purpose)` | `list[UUID]`: the campaign audience |
+| `kit.audit(db, subject_id)` / `kit.audit_by_phone(db, owner_id, phone)` | `AuditRecord`: every event and erasure request (survives erasure, by fingerprint) |
+| `kit.erase_subject(db, subject_id, DataRequestSource)` | `DataRequest \| None` |
+| `kit.erase_owner(db, owner_id)` | `int` subjects erased (closing an owner's account) |
+| `kit.run_maintenance(db)` | `dict[str, int]` counts |
+| `kit.parse_webhook(raw_body, signature_header)` | `list[InboundEvent]`; raises `InvalidSignature` / `InvalidWebhookPayload` |
+| `kit.handle_inbound(db, owner_id, events)` | `list[InboundOutcome]` `{type, event, subject_ids, preferences_url}` |
+| `kit.owner_router(prefix)` / `kit.public_router()` | FastAPI routers |
+
+Other modules: `whatsapp_consent.library` (`load_purposes`, `load_notices`), `whatsapp_consent.messages`
+(`opt_out_footer`, `stop_button`, `manage_button`, `stop_button_parameter`, `manage_button_parameter`),
+`whatsapp_consent.senders` (`VerificationSender`, `DeliveryFailed`, `FakeSender`), `whatsapp_consent.meta`
+(`InboundEvent`, `InvalidSignature`, `InvalidWebhookPayload`).
+
+### CLI
+
+| Command | What it does |
+|---|---|
+| `whatsapp-consent migrate` | applies the kit's migrations (schema `whatsapp_consent`) |
+| `whatsapp-consent maintenance [--cleanup-unverified-without-host-hook]` | purges expired anonymised records; prints JSON counts |
+
 ## Good to know
 
 - Looking up a number on the preferences page counts toward that number's code limits (3 an hour, 10 a day), even
   when it isn't registered, so the answer looks the same either way.
 - A minor's own number (no guardian on record) can withdraw consent but never grant it; only a guardian's verified
   consent can.
+- Guardian consent is a declaration: a minor holding the guardian link could declare a guardian on their own
+  number. Owners who mark minors should review guardian sign-ups.
+- If a new notice version is published in only some languages, the other languages keep showing their latest
+  version.
 
 ## Before launch
 

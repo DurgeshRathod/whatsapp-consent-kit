@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ t('page_title_consent') }}</h1>
+<p>{{ t('intro', business=business) }}</p>
+<h2>{{ t('who_label') }}</h2>
+<a class="button" href="/c/{{ token }}?who=me&amp;lang={{ lang }}">{{ t('who_me') }}</a>
+<a class="button secondary" href="/c/{{ token }}?who=child&amp;lang={{ lang }}">{{ t('who_child') }}</a>
+{% endblock %}

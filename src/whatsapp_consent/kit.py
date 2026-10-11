@@ -1,0 +1,152 @@
+"""ConsentKit: a host's configuration, and the kit's public Python API and routers."""
+
+import json
+import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
+
+from fastapi import APIRouter
+from sqlalchemy.orm import Session
+
+from whatsapp_consent.audit import AuditRecord, audit_phone, audit_subject
+from whatsapp_consent.config import ConsentSettings
+from whatsapp_consent.enums import DataRequestSource, Language, TemplateCategory
+from whatsapp_consent.erasure import erase_owner, erase_subject, run_maintenance
+from whatsapp_consent.gate import can_send, can_send_category, sendable_subjects
+from whatsapp_consent.inbound import InboundOutcome, handle_inbound
+from whatsapp_consent.meta import InboundEvent, InvalidWebhookPayload, parse_webhook, verify_signature
+from whatsapp_consent.models import DataRequest, Subject
+from whatsapp_consent.senders import VerificationSender, resolve_sender
+from whatsapp_consent.status import SubjectState, state_of, status_by_phone
+
+
+@dataclass(frozen=True)
+class OwnerInfo:
+    """What the public pages and share messages say about an owner."""
+
+    display_name: str  # the business named in every opt-in (a Meta requirement)
+    language: Language = Language.EN
+    whatsapp_number: str | None = None  # E.164; enables click-to-chat verification for this owner
+
+
+@dataclass(frozen=True)
+class OwnerContext:
+    """What the host's owner dependency returns for the signed-in owner."""
+
+    owner_id: uuid.UUID
+    info: OwnerInfo
+
+
+OwnerLookup = Callable[[Session, uuid.UUID], OwnerInfo | None]
+ErasureHook = Callable[[Session, uuid.UUID, uuid.UUID], None]
+
+
+class ConsentKit:
+    def __init__(
+        self,
+        *,
+        settings: ConsentSettings,
+        session_dependency: Callable[..., Any],
+        owner_dependency: Callable[..., Any],
+        owner_lookup: OwnerLookup,
+        sender: VerificationSender | None = None,
+        on_subject_erased: ErasureHook | None = None,
+    ) -> None:
+        """
+        session_dependency: the host's FastAPI dependency yielding a SQLAlchemy Session.
+        owner_dependency: the host's FastAPI dependency returning OwnerContext (raising its own 401/409).
+        owner_lookup: (db, owner_id) -> OwnerInfo | None, for public pages.
+        sender: a VerificationSender for authentication-template codes (not needed with the fake method).
+        on_subject_erased: (db, owner_id, subject_id) -> None; delete the host's data about the person,
+        in the same transaction.
+        """
+        self.settings = settings
+        self.session_dependency = session_dependency
+        self.owner_dependency = owner_dependency
+        self.owner_lookup = owner_lookup
+        self.sender: VerificationSender = resolve_sender(settings, sender)
+        self.on_subject_erased = on_subject_erased
+
+    @property
+    def key(self) -> str:
+        return self.settings.fingerprint_key
+
+    # Questions a host asks
+
+    def status(self, db: Session, subject_id: uuid.UUID) -> SubjectState | None:
+        subject = db.get(Subject, subject_id)
+        return state_of(db, subject) if subject else None
+
+    def status_by_phone(self, db: Session, owner_id: uuid.UUID, phone: str) -> list[SubjectState]:
+        return status_by_phone(db, owner_id, phone, key=self.key)
+
+    def can_send(self, db: Session, subject_id: uuid.UUID, purpose: str) -> bool:
+        return can_send(db, subject_id, purpose)
+
+    def can_send_category(self, db: Session, subject_id: uuid.UUID, category: TemplateCategory) -> bool:
+        return can_send_category(db, subject_id, category)
+
+    def sendable_subjects(self, db: Session, owner_id: uuid.UUID, purpose: str) -> list[uuid.UUID]:
+        return sendable_subjects(db, owner_id, purpose)
+
+    def audit(self, db: Session, subject_id: uuid.UUID) -> AuditRecord | None:
+        return audit_subject(db, subject_id)
+
+    def audit_by_phone(self, db: Session, owner_id: uuid.UUID, phone: str) -> AuditRecord:
+        return audit_phone(db, owner_id, phone, key=self.key)
+
+    # Erasure and retention
+
+    def erase_subject(self, db: Session, subject_id: uuid.UUID, source: DataRequestSource) -> DataRequest | None:
+        subject = db.get(Subject, subject_id)
+        if subject is None:
+            return None
+        return erase_subject(db, subject, source=source, on_erased=self.on_subject_erased)
+
+    def erase_owner(self, db: Session, owner_id: uuid.UUID) -> int:
+        return erase_owner(db, owner_id, on_erased=self.on_subject_erased)
+
+    def run_maintenance(self, db: Session) -> dict[str, int]:
+        """Prefer this to the CLI inside a host: it also calls the host's erasure hook."""
+        return run_maintenance(db, retention_days=self.settings.retention_days, on_erased=self.on_subject_erased)
+
+    # Routers
+
+    def owner_router(self, prefix: str = "/subjects") -> APIRouter:
+        from whatsapp_consent.api.router import build_owner_router
+
+        return build_owner_router(self, prefix)
+
+    def public_router(self) -> APIRouter:
+        """The pages people use: consent, code, preferences, notice. Mount without a prefix."""
+        from whatsapp_consent.web import routes_consent, routes_notice, routes_preferences
+        from whatsapp_consent.web.render import Pages
+
+        pages = Pages(self.settings)
+        router = APIRouter(include_in_schema=False)
+        router.include_router(routes_consent.build(self, pages))
+        router.include_router(routes_notice.build(self, pages))
+        router.include_router(routes_preferences.build(self, pages))
+        return router
+
+    # WhatsApp
+
+    def parse_webhook(self, raw_body: bytes, signature_header: str | None) -> list[InboundEvent]:
+        """Checks the signature with CONSENT_META_APP_SECRET, then parses. Raises InvalidSignature (reply 403) or
+        InvalidWebhookPayload (a signed body that is malformed: reply 400)."""
+        if not self.settings.meta_app_secret:
+            raise RuntimeError("Set CONSENT_META_APP_SECRET to check webhook signatures")
+        verify_signature(raw_body, signature_header, self.settings.meta_app_secret)
+        try:
+            body = json.loads(raw_body)
+        except (ValueError, RecursionError) as error:
+            raise InvalidWebhookPayload("webhook body is not valid JSON") from error
+        return parse_webhook(body)
+
+    def handle_inbound(self, db: Session, owner_id: uuid.UUID, events: list[InboundEvent]) -> list[InboundOutcome]:
+        """The host maps a phone_number_id to its owner, calls this with that number's events, commits, and acts on
+        the outcomes. Raises ValueError if the events come from more than one phone_number_id."""
+        if len({event.phone_number_id for event in events}) > 1:
+            raise ValueError("Group events by phone_number_id: one owner per call")
+        return handle_inbound(db, owner_id=owner_id, events=events, settings=self.settings)
