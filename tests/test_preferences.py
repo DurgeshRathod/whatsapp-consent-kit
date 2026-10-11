@@ -231,15 +231,16 @@ def exists(client, headers, subject_id) -> bool:
     return client.get(f"/subjects/{subject_id}", headers=headers).status_code == 200
 
 
-def test_lookup_cookie_for_another_number_gives_no_link(client, owner, relaxed_limits):
-    headers, _, _, (phone_a, phone_b) = two_numbers(client, owner)
+def test_lookup_link_is_only_for_the_number_whose_code_was_entered(client, owner, relaxed_limits):
+    _, ids, _, (phone_a, _) = two_numbers(client, owner)
     start_lookup(client, phone_a[3:])
-    row_a = verification_id(phone_a, "preferences")
-    code = last_code(phone_a)
+    row_a, code = verification_id(phone_a, "preferences"), last_code(phone_a)
     page = client.get("/p/verify")
-    client.cookies.set("wck_flow", flow_cookie({"pv": row_a, "pf": fp(phone_b), "l": "en"}))
+    client.cookies.set("wck_flow", flow_cookie({"pv": row_a, "l": "en"}))
     res = client.post("/p/verify", data={"csrf": csrf_of(page), "lang": "en", "code": code}, follow_redirects=False)
-    assert res.status_code == 422 and "That code isn't right." in text_of(res)
+    assert res.status_code == 303
+    body = text_of(client.get(res.headers["location"]))
+    assert "Priya Nutrition" in body and "For " not in body and body.count("<section") == 1  # number A only
 
 
 def test_lookup_cookie_pointing_at_a_deletion_code_gives_no_link(client, owner, relaxed_limits):
@@ -248,7 +249,7 @@ def test_lookup_cookie_pointing_at_a_deletion_code_gives_no_link(client, owner, 
     row = verification_id(phone_a, "deletion")
     code = last_code(phone_a)
     page = client.get("/p")
-    client.cookies.set("wck_flow", flow_cookie({"pv": row, "pf": fp(phone_a), "l": "en"}))
+    client.cookies.set("wck_flow", flow_cookie({"pv": row, "l": "en"}))
     res = client.post("/p/verify", data={"csrf": csrf_of(page), "lang": "en", "code": code}, follow_redirects=False)
     assert res.status_code == 422
 
@@ -272,6 +273,21 @@ def submit_only(client, path, data):
     return submit(client, path, "me", data)
 
 
+def flow_of(response) -> dict:
+    import os
+
+    from itsdangerous import URLSafeTimedSerializer
+
+    serializer = URLSafeTimedSerializer(os.environ["CONSENT_SESSION_SECRET"], salt="whatsapp-consent-flow")
+    return serializer.loads(response.cookies.get("wck_flow"))
+
+
+def shape(value):
+    import re
+
+    return re.sub(r"[0-9a-f]", "h", value) if isinstance(value, str) else type(value).__name__
+
+
 def test_registered_and_unregistered_numbers_look_the_same(client, owner, relaxed_limits):
     import re
 
@@ -284,15 +300,25 @@ def test_registered_and_unregistered_numbers_look_the_same(client, owner, relaxe
 
     def run(phone):
         start = start_lookup(client, phone)
+        flow = flow_of(start)
         page = client.get(start.headers["location"])
-        return start.status_code, start.headers["location"], re.sub(r'value="[^"]+"', "", text_of(page)), page
+        alerts = []
+        for _ in range(5):
+            page = client.get("/p/verify")
+            res = client.post("/p/verify", data={"csrf": csrf_of(page), "lang": "en", "code": "000001"})
+            found = re.search(r'role="alert">(.*?)</div>', text_of(res), re.S)
+            assert found
+            alerts.append((res.status_code, found.group(1)))
+        quoted = re.sub(r'value="[^"]+"', "", text_of(page))
+        return start.headers["location"], {k: shape(v) for k, v in flow.items()}, quoted, alerts
 
     registered = run(data["phone"])
     sent = len(fake_sender.sent)
     unknown = run(local_phone())
-    assert len(fake_sender.sent) == sent
-    assert registered[:3] == unknown[:3]
-    assert registered[3].status_code == unknown[3].status_code == 200
+    assert len(fake_sender.sent) == sent  # nothing was sent for the unregistered number
+    assert registered == unknown
+    assert registered[1]["pv"] == "hhhhhhhh-hhhh-hhhh-hhhh-hhhhhhhhhhhh" and set(registered[1]) == {"pv", "l"}
+    assert "isn't right" in registered[3][-1][1] or "Too many" in registered[3][-1][1]
 
 
 def test_deletion_cookie_for_another_numbers_row_deletes_nothing(client, owner, relaxed_limits):
@@ -301,7 +327,7 @@ def test_deletion_cookie_for_another_numbers_row_deletes_nothing(client, owner, 
     row_a, code = verification_id(phone_a, "deletion"), last_code(phone_a)
     page = client.get(prefs_b)
     token_b = prefs_b.rsplit("/", 1)[1]
-    client.cookies.set("wck_flow", flow_cookie({"dv": row_a, "pf": fp(phone_a), "targets": [id_a, id_b], "l": "en"}))
+    client.cookies.set("wck_flow", flow_cookie({"dv": row_a, "targets": [id_a, id_b], "l": "en"}))
     res = client.post(
         f"{prefs_b}/delete/confirm", data={"csrf": csrf_of(page), "lang": "en", "code": code}, follow_redirects=False
     )
@@ -314,7 +340,7 @@ def test_deletion_cookie_pointing_at_a_lookup_row_deletes_nothing(client, owner,
     start_lookup(client, phone_a[3:])
     row, code = verification_id(phone_a, "preferences"), last_code(phone_a)
     page = client.get(prefs_a)
-    client.cookies.set("wck_flow", flow_cookie({"dv": row, "pf": fp(phone_a), "targets": [id_a], "l": "en"}))
+    client.cookies.set("wck_flow", flow_cookie({"dv": row, "targets": [id_a], "l": "en"}))
     res = client.post(f"{prefs_a}/delete/confirm", data={"csrf": csrf_of(page), "lang": "en", "code": code})
     assert res.status_code != 200
     assert exists(client, headers, id_a)
@@ -325,7 +351,7 @@ def test_deletion_targets_are_checked_against_the_verified_number(client, owner,
     start_delete(client, prefs_b, id_b)
     row, code = verification_id(phone_b, "deletion"), last_code(phone_b)
     page = client.get(prefs_b)
-    forged = {"dv": row, "pf": fp(phone_b), "targets": [id_b, id_a, "not-an-id"], "l": "en"}
+    forged = {"dv": row, "targets": [id_b, id_a, "not-an-id"], "l": "en"}
     client.cookies.set("wck_flow", flow_cookie(forged))
     res = client.post(f"{prefs_b}/delete/confirm", data={"csrf": csrf_of(page), "lang": "en", "code": code})
     assert res.status_code == 200
@@ -381,3 +407,70 @@ def test_every_preferences_post_needs_csrf(client, owner, relaxed_limits):
             path, data={"csrf": "wrong", "lang": "en", "phone": phone_a, "code": "123456", "target": id_a}
         )
         assert res.status_code == 403, path
+
+
+def test_lookup_after_the_hourly_cap_reuses_the_pending_code_for_both_kinds(client, owner, monkeypatch):
+    from datetime import timedelta
+
+    import whatsapp_consent.verification as v
+
+    monkeypatch.setattr(v, "RESEND_AFTER", timedelta(0))
+    monkeypatch.setattr(v, "MAX_PER_DAY", 100)
+    monkeypatch.setattr(v, "MAX_PER_HOUR", 1)
+    _, headers = owner()
+    data = adult()
+    _, path = add_subject(client, headers, phone=data["phone"])
+    monkeypatch.setattr(v, "MAX_PER_HOUR", 100)
+    consent_and_verify(client, path, data=data)
+    monkeypatch.setattr(v, "MAX_PER_HOUR", 2)
+    first = flow_of(start_lookup(client, data["phone"]))["pv"]
+    code = last_code(e164(data["phone"]))
+    second = flow_of(start_lookup(client, data["phone"]))["pv"]  # capped: reuses the pending code
+    assert first == second
+    page = client.get("/p/verify")
+    res = client.post("/p/verify", data={"csrf": csrf_of(page), "lang": "en", "code": code}, follow_redirects=False)
+    assert res.status_code == 303
+
+
+def make_minor(client, owner):
+    _, headers = owner()
+    data = adult()
+    subject_id, path = add_subject(client, headers, phone=data["phone"])
+    prefs = consent_and_verify(client, path, data=data)
+    assert client.post(f"/subjects/{subject_id}/mark-minor", headers=headers).status_code == 200
+    return headers, subject_id, prefs
+
+
+def test_a_minors_own_number_can_withdraw_but_not_grant(client, owner, relaxed_limits):
+    headers, subject_id, prefs = make_minor(client, owner)
+    res = toggle(client, prefs, subject_id, ["service"])
+    assert res.status_code == 303
+    info = client.get(f"/subjects/{subject_id}", headers=headers).json()
+    assert info["history"][-1]["given_by"] == "self" and info["history"][-1]["action"] == "withdrawn"
+    before = len(info["history"])
+    res = toggle(client, prefs, subject_id, ["service", "updates"])
+    assert res.status_code == 422 and "guardian" in text_of(res).lower()
+    after = client.get(f"/subjects/{subject_id}", headers=headers).json()
+    assert len(after["history"]) == before and after["consents"] == info["consents"]
+
+
+def test_delete_all_removes_unverified_subjects_of_the_number_too(client, owner, relaxed_limits):
+    _, first = owner()
+    _, second = owner()
+    phone = local_phone()
+    id_a, path_a = add_subject(client, first, phone=phone)
+    id_b, _ = add_subject(client, second, phone=phone)  # never verified
+    prefs = consent_and_verify(client, path_a, data=adult(phone=phone))
+    assert delete(client, prefs, "all", e164(phone)).status_code == 200
+    assert not exists(client, first, id_a) and not exists(client, second, id_b)
+
+
+def test_starting_deletion_is_rate_limited_per_ip(client, kit, owner, relaxed_limits, monkeypatch):
+    from whatsapp_consent.senders import fake_sender
+
+    _, (id_a, _), (prefs_a, _), _ = two_numbers(client, owner)
+    page = client.get(prefs_a)
+    monkeypatch.setattr(kit.settings, "web_submissions_per_ip_hour", 0)
+    sent = len(fake_sender.sent)
+    res = client.post(f"{prefs_a}/delete", data={"csrf": csrf_of(page), "lang": "en", "target": id_a})
+    assert res.status_code == 429 and len(fake_sender.sent) == sent

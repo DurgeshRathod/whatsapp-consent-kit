@@ -6,10 +6,18 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse, Response
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from whatsapp_consent.enums import ConsentSource, DataRequestSource, Language, VerificationPurpose
-from whatsapp_consent.events import Evidence, active_purposes, given_by_for, purpose_codes, set_consent
+from whatsapp_consent.enums import (
+    ConsentSource,
+    DataRequestSource,
+    GivenBy,
+    Language,
+    VerificationMethod,
+    VerificationPurpose,
+)
+from whatsapp_consent.events import Evidence, active_purposes, current_consent, purpose_codes, set_consent
 from whatsapp_consent.hashing import phone_fingerprint
 from whatsapp_consent.models import PreferenceLink, Subject, Verification
 from whatsapp_consent.notices import latest_notice
@@ -17,6 +25,7 @@ from whatsapp_consent.phones import InvalidPhone, mask_phone, normalise_phone
 from whatsapp_consent.preference_links import issue_preference_link, resolve_preference_link
 from whatsapp_consent.preferences import preference_entries
 from whatsapp_consent.ratelimit import allow
+from whatsapp_consent.senders import VerificationSender
 from whatsapp_consent.verification import VerificationError, check_code, latest_pending, start_code_verification
 from whatsapp_consent.web.i18n import pick_lang, t
 from whatsapp_consent.web.render import Pages
@@ -33,6 +42,16 @@ def _uuid(value: Any) -> uuid.UUID | None:
     try:
         return uuid.UUID(str(value))
     except ValueError:
+        return None
+
+
+class _SilentSender:
+    """Stands in for the real sender when the number isn't registered: same rows and limits, nothing sent."""
+
+    def __init__(self, method: VerificationMethod) -> None:
+        self.method = method
+
+    def send_code(self, phone_e164: str, code: str, language: Language) -> None:
         return None
 
 
@@ -61,22 +80,36 @@ def build(kit: "ConsentKit", pages: Pages) -> APIRouter:
             return None
         return subject
 
-    def flow_row(
-        db: Session, flow: dict, field: str, purpose: VerificationPurpose, fingerprint: str
-    ) -> Verification | None:
-        """The flow's verification row, only if it is a phone-only row of this purpose for exactly this number."""
+    def flow_row(db: Session, flow: dict, field: str, purpose: VerificationPurpose) -> Verification | None:
+        """The flow's verification row, only if it is a phone-only row of this purpose (never a consent row)."""
         verification_id = _uuid(flow.get(field)) if flow.get(field) else None
-        if verification_id is None or not fingerprint or flow.get("pf") != fingerprint:
+        if verification_id is None:
             return None
         row = db.get(Verification, verification_id)
-        if (
-            row is None
-            or row.purpose != purpose
-            or row.subject_id is not None
-            or phone_fingerprint(kit.key, row.phone_e164) != fingerprint
-        ):
+        if row is None or row.purpose != purpose or row.subject_id is not None:
             return None
         return row
+
+    def deletion_row(db: Session, flow: dict, link: PreferenceLink) -> Verification | None:
+        """The deletion code row, only if it was sent to the very number this link belongs to."""
+        row = flow_row(db, flow, "dv", VerificationPurpose.DELETION)
+        if row is None or phone_fingerprint(kit.key, row.phone_e164) != link.phone_fingerprint:
+            return None
+        return row
+
+    def start_or_reuse(
+        db: Session, phone: str, purpose: VerificationPurpose, language: Language, sender: VerificationSender
+    ) -> str:
+        """Starts a code; on any refusal reuses the number's pending code. Always returns an id (maybe unknown)."""
+        try:
+            return str(
+                start_code_verification(
+                    db, phone=phone, purpose=purpose, language=language, sender=sender, key=kit.key
+                ).id
+            )
+        except VerificationError:
+            pending = latest_pending(db, phone=phone, purpose=purpose, subject_id=None)
+            return str(pending.id if pending else uuid.uuid4())
 
     def lookup_form(
         request: Request, lang: Language, *, phone: str = "", errors: list[str] | None = None, status_code: int = 200
@@ -205,29 +238,15 @@ def build(kit: "ConsentKit", pages: Pages) -> APIRouter:
         if not allowed:
             return lookup_form(request, language, phone=phone, errors=["err_rate_limited"], status_code=429)
 
-        fingerprint = phone_fingerprint(kit.key, phone_e164)
-        verification_id = ""
-        if preference_entries(db, fingerprint, kit.owner_lookup):
-            try:
-                verification = start_code_verification(
-                    db,
-                    phone=phone_e164,
-                    purpose=VerificationPurpose.PREFERENCES,
-                    language=language,
-                    sender=kit.sender,
-                    key=kit.key,
-                )
-                verification_id = str(verification.id)
-            except VerificationError as error:
-                if error.reason == "too_soon":
-                    pending = latest_pending(
-                        db, phone=phone_e164, purpose=VerificationPurpose.PREFERENCES, subject_id=None
-                    )
-                    verification_id = str(pending.id) if pending else ""
-            db.commit()
+        # One code path for every number, registered or not, so nothing (cookie, attempts, limits, timing of
+        # the answer) tells them apart. An unregistered number gets a real row with an unguessable code and a
+        # sender that sends nothing. Sender latency is the host's responsibility: queue the send in its sender.
+        registered = bool(preference_entries(db, phone_fingerprint(kit.key, phone_e164), kit.owner_lookup))
+        sender = kit.sender if registered else _SilentSender(kit.sender.method)
+        verification_id = start_or_reuse(db, phone_e164, VerificationPurpose.PREFERENCES, language, sender)
+        db.commit()
         response = pages.redirect(f"/p/verify?lang={language.value}")
-        # `pf` is always set, so the cookie looks the same for a number that isn't registered.
-        pages.write_flow(response, {"pv": verification_id, "pf": fingerprint, "l": language.value})
+        pages.write_flow(response, {"pv": verification_id, "l": language.value})
         return response
 
     @router.get("/p/verify", response_class=HTMLResponse)
@@ -250,9 +269,8 @@ def build(kit: "ConsentKit", pages: Pages) -> APIRouter:
         language = pages.flow_lang(lang, flow)
         if not flow or "pv" not in flow or not pages.csrf_ok(request, csrf):
             return pages.session_expired(request, language)
-        fingerprint = str(flow.get("pf") or "")
-        row = flow_row(db, flow, "pv", VerificationPurpose.PREFERENCES, fingerprint) if flow["pv"] else None
-        if row is None:  # an unregistered number, or a cookie that doesn't match its row: same answer as a wrong code
+        row = flow_row(db, flow, "pv", VerificationPurpose.PREFERENCES)
+        if row is None:  # a cookie that doesn't match a lookup row: same answer as a wrong code
             return lookup_code(request, language, errors=["err_wrong_code"], status_code=422)
         try:
             verification = check_code(
@@ -304,12 +322,19 @@ def build(kit: "ConsentKit", pages: Pages) -> APIRouter:
         subject = owned(db, link, subject_id)
         if subject is None:
             return not_found(request, language)
+        has_guardian = subject.guardian_name is not None
+        current = current_consent(db, subject.id)
+        wanted = {code: code in purposes for code in purpose_codes(db)}
+        # A minor's own number may only withdraw; granting needs the guardian's consent.
+        own_number_minor = subject.is_minor and (not has_guardian or subject.minor_suspended)
+        if own_number_minor and any(granted and not current.get(code) for code, granted in wanted.items()):
+            return preferences(request, db, language, token, link, errors=["err_minor_needs_guardian"], status_code=422)
         set_consent(
             db,
             subject,
-            {code: code in purposes for code in purpose_codes(db)},
+            wanted,
             source=ConsentSource.PREFERENCES_PAGE,
-            given_by=given_by_for(subject),
+            given_by=GivenBy.GUARDIAN if has_guardian else GivenBy.SELF,
             notice=latest_notice(db, language),
             evidence=Evidence(client_ip(request), request.headers.get("user-agent")),
         )
@@ -331,8 +356,17 @@ def build(kit: "ConsentKit", pages: Pages) -> APIRouter:
         link = resolve_preference_link(db, token)
         if link is None:
             return link_invalid(request, language)
-        subjects = [e.subject for e in preference_entries(db, link.phone_fingerprint, kit.owner_lookup)]
-        targets = subjects if target == "all" else [s for s in subjects if str(s.id) == target]
+        limit = settings.web_submissions_per_ip_hour
+        allowed = allow(db, bucket="prefs_delete", key=client_ip(request), limit=limit, window=HOUR, hash_key=kit.key)
+        db.commit()
+        if not allowed:
+            return preferences(request, db, language, token, link, errors=["err_rate_limited"], status_code=429)
+        if target == "all":
+            # The code proves control of the number: everything held for it goes, verified or not.
+            targets = list(db.scalars(select(Subject).where(Subject.phone_fingerprint == link.phone_fingerprint)))
+        else:
+            verified = [e.subject for e in preference_entries(db, link.phone_fingerprint, kit.owner_lookup)]
+            targets = [s for s in verified if str(s.id) == target]
         if not targets:
             return not_found(request, language)
         phone = targets[0].phone_e164
@@ -341,20 +375,17 @@ def build(kit: "ConsentKit", pages: Pages) -> APIRouter:
                 db, phone=phone, purpose=VerificationPurpose.DELETION, language=language, sender=kit.sender, key=kit.key
             )
         except VerificationError as error:
-            pending = None
-            if error.reason == "too_soon":
-                pending = latest_pending(db, phone=phone, purpose=VerificationPurpose.DELETION, subject_id=None)
-            if pending is None:
+            verification = latest_pending(db, phone=phone, purpose=VerificationPurpose.DELETION, subject_id=None)
+            if verification is None:
                 db.commit()
                 return preferences(request, db, language, token, link, errors=[f"err_{error.reason}"], status_code=429)
-            verification = pending
         db.commit()
         response = pages.redirect(f"/p/{token}/delete?lang={language.value}")
         pages.write_flow(
             response,
             {
                 "dv": str(verification.id),
-                "pf": link.phone_fingerprint,
+                "all": target == "all",
                 "targets": [str(s.id) for s in targets],
                 "l": language.value,
             },
@@ -372,7 +403,7 @@ def build(kit: "ConsentKit", pages: Pages) -> APIRouter:
         link = resolve_preference_link(db, token)
         if link is None:
             return link_invalid(request, language)
-        verification = flow_row(db, flow, "dv", VerificationPurpose.DELETION, link.phone_fingerprint)
+        verification = deletion_row(db, flow, link)
         if verification is None:
             return pages.session_expired(request, language)
         return deletion_code(request, language, token, verification.phone_e164)
@@ -394,7 +425,7 @@ def build(kit: "ConsentKit", pages: Pages) -> APIRouter:
         if link is None:
             return link_invalid(request, language)
         fingerprint = link.phone_fingerprint
-        verification = flow_row(db, flow, "dv", VerificationPurpose.DELETION, fingerprint)
+        verification = deletion_row(db, flow, link)
         if verification is None:
             return pages.session_expired(request, language)
         phone = verification.phone_e164
@@ -405,10 +436,14 @@ def build(kit: "ConsentKit", pages: Pages) -> APIRouter:
         except VerificationError as error:
             db.commit()
             return deletion_code(request, language, token, phone, errors=[f"err_{error.reason}"], status_code=422)
-        # Never trust ids from the cookie: only subjects of the verified number, still verified, can be erased.
-        wanted = {str(i) for i in flow.get("targets", []) if isinstance(i, str)}
-        current = [e.subject.id for e in preference_entries(db, fingerprint, kit.owner_lookup)]
-        for subject_id in [i for i in current if str(i) in wanted]:
+        # Never trust ids from the cookie: re-derive from the subjects of the number that was just verified.
+        if flow.get("all") is True:
+            current = list(db.scalars(select(Subject.id).where(Subject.phone_fingerprint == fingerprint)))
+        else:
+            wanted = {str(i) for i in flow.get("targets", []) if isinstance(i, str)}
+            verified = [e.subject.id for e in preference_entries(db, fingerprint, kit.owner_lookup)]
+            current = [i for i in verified if str(i) in wanted]
+        for subject_id in current:
             kit.erase_subject(db, subject_id, DataRequestSource.SUBJECT)
         db.commit()
         response = pages.message(
