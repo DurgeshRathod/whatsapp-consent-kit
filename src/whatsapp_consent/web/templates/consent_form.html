@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ t('page_title_consent') }}</h1>
+<p>{{ t('intro', business=business) }}</p>
+{% if errors %}
+<div class="errors" role="alert">{% for e in errors %}<p>{{ t(e) }}</p>{% endfor %}</div>
+{% endif %}
+<form method="post" action="/c/{{ token }}">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="lang" value="{{ lang }}">
+<input type="hidden" name="who" value="{{ who }}">
+{% if who == 'me' %}
+<label for="name">{{ t('name') }}</label>
+<input id="name" name="name" type="text" autocomplete="name" maxlength="80" value="{{ values.name }}" required>
+<label for="phone">{{ t('phone') }}</label>
+<input id="phone" name="phone" type="tel" autocomplete="tel" maxlength="24" value="{{ values.phone }}" required>
+<label for="birth_year">{{ t('birth_year') }}</label>
+<input id="birth_year" name="birth_year" type="number" inputmode="numeric" min="1900" max="{{ current_year }}" value="{{ values.birth_year }}" required>
+<p class="hint">{{ t('birth_year_hint') }}</p>
+{% set birthday_label = t('birthday') %}
+{% else %}
+<label for="guardian_name">{{ t('guardian_name') }}</label>
+<input id="guardian_name" name="guardian_name" type="text" autocomplete="name" maxlength="80" value="{{ values.guardian_name }}" required>
+<label for="guardian_relation">{{ t('guardian_relation') }}</label>
+<input id="guardian_relation" name="guardian_relation" type="text" maxlength="40" placeholder="{{ t('guardian_relation_placeholder') }}" value="{{ values.guardian_relation }}" required>
+<label for="phone">{{ t('guardian_phone') }}</label>
+<input id="phone" name="phone" type="tel" autocomplete="tel" maxlength="24" value="{{ values.phone }}" required>
+<label for="child_name">{{ t('child_name') }}</label>
+<input id="child_name" name="child_name" type="text" maxlength="80" value="{{ values.child_name }}" required>
+{% set birthday_label = t('child_birthday') %}
+{% endif %}
+<label for="birthday_day">{{ birthday_label }}</label>
+<div class="row">
+<select id="birthday_day" name="birthday_day" aria-label="{{ t('day') }}">
+<option value="">{{ t('day') }}</option>
+{% for d in range(1, 32) %}<option value="{{ d }}"{% if values.birthday_day == d|string %} selected{% endif %}>{{ d }}</option>{% endfor %}
+</select>
+<select name="birthday_month" aria-label="{{ t('month') }}">
+<option value="">{{ t('month') }}</option>
+{% for m in months %}<option value="{{ loop.index }}"{% if values.birthday_month == loop.index|string %} selected{% endif %}>{{ m }}</option>{% endfor %}
+</select>
+</div>
+<p class="hint">{{ t('birthday_hint') }}</p>
+<fieldset>
+<legend>{{ t('purposes_label') }}</legend>
+{% for p in purposes %}
+<label class="check"><input type="checkbox" name="purposes" value="{{ p.code }}"{% if p.code in values.purposes %} checked{% endif %}><span><strong>{{ p.labels[lang].name }}</strong>: {{ p.labels[lang].description }}</span></label>
+{% endfor %}
+</fieldset>
+{% if who == 'child' %}
+<label class="check"><input type="checkbox" name="declaration" value="yes"{% if values.declaration == 'yes' %} checked{% endif %}><span>{{ t('declaration') }}</span></label>
+{% endif %}
+<p class="hint">{{ t('no_health_info') }}</p>
+<div class="notice">
+<p>{{ notice.summary }}</p>
+<p><a href="/notice/{{ notice.version }}?lang={{ lang }}">{{ t('read_notice') }}</a></p>
+</div>
+<button type="submit">{{ t('submit') }}</button>
+</form>
+{% if not minor_only %}<p><a href="/c/{{ token }}?lang={{ lang }}">{{ t('change_who') }}</a></p>{% endif %}
+{% endblock %}

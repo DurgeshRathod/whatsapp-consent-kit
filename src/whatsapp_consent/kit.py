@@ -101,10 +101,11 @@ class ConsentKit:
 
     def public_router(self) -> APIRouter:
         """The pages people use: consent, code, preferences, notice. Mount without a prefix."""
-        from whatsapp_consent.web import routes_notice
+        from whatsapp_consent.web import routes_consent, routes_notice
         from whatsapp_consent.web.render import Pages
 
         pages = Pages(self.settings)
         router = APIRouter(include_in_schema=False)
+        router.include_router(routes_consent.build(self, pages))
         router.include_router(routes_notice.build(self, pages))
         return router

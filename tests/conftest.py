@@ -149,3 +149,28 @@ def owner():
         return owner_id, {"X-Owner-Id": str(owner_id)}
 
     return make
+
+
+@pytest.fixture
+def relaxed_limits(monkeypatch):
+    """For tests that verify the same number several times in a row."""
+    from datetime import timedelta
+
+    import whatsapp_consent.verification as verification
+
+    monkeypatch.setattr(verification, "RESEND_AFTER", timedelta(0))
+    monkeypatch.setattr(verification, "MAX_PER_HOUR", 100)
+    monkeypatch.setattr(verification, "MAX_PER_DAY", 100)
+
+
+@pytest.fixture
+def click_client(database):
+    """The example host with click-to-chat verification enabled."""
+    import example_host
+    from fastapi.testclient import TestClient
+
+    from whatsapp_consent.config import ConsentSettings
+
+    click_kit = example_host.build_kit(ConsentSettings(click_to_chat=True))  # pyright: ignore[reportCallIssue]
+    with TestClient(example_host.build_app(click_kit)) as test_client:
+        yield test_client
