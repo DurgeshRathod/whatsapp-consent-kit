@@ -2,17 +2,18 @@
 Meta's marketing opt-out signal. Text is matched in memory and never stored."""
 
 import re
-import string
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from whatsapp_consent.config import ConsentSettings
-from whatsapp_consent.enums import ConsentSource, GivenBy, InboundEventType, InboundOutcomeType, TemplateCategory
-from whatsapp_consent.events import active_purposes, purpose_codes, set_consent
+from whatsapp_consent.enums import ConsentSource, InboundEventType, InboundOutcomeType, TemplateCategory
+from whatsapp_consent.events import active_purposes, given_by_for, purpose_codes, set_consent
 from whatsapp_consent.meta import InboundEvent
 from whatsapp_consent.models import Subject
 from whatsapp_consent.preference_links import issue_preference_link, preference_url
@@ -28,8 +29,6 @@ MANAGE_BUTTON = "whatsapp_consent:manage"
 # relying on it in production (spec §15, open item 1).
 MARKETING_OPT_OUT_ERROR_CODES = frozenset({131050})
 
-_SEPARATORS = re.compile(r"[\s" + re.escape(string.punctuation) + "।]+")
-
 
 @dataclass(frozen=True)
 class InboundOutcome:
@@ -41,17 +40,18 @@ class InboundOutcome:
 
 
 def normalise_words(text: str) -> str:
-    return " ".join(word for word in _SEPARATORS.split(text.strip().lower()) if word)
+    """Lower-cased words with punctuation, symbols, emoji and invisible format characters treated as separators."""
+    folded = unicodedata.normalize("NFKC", text).casefold()
+    spaced = "".join(
+        " " if ch.isspace() or unicodedata.category(ch)[0] in "PS" or unicodedata.category(ch) == "Cf" else ch
+        for ch in folded
+    )
+    return " ".join(spaced.split())
 
 
 def _subjects(db: Session, owner_id: uuid.UUID, phone: str) -> list[Subject]:
     query = select(Subject).where(Subject.owner_id == owner_id, Subject.phone_e164 == phone)
     return list(db.scalars(query.order_by(Subject.created_at)))
-
-
-def _given_by(subject: Subject) -> GivenBy:
-    """GUARDIAN only when a minor has guardian details on record; otherwise the person on the number is SELF."""
-    return GivenBy.GUARDIAN if subject.is_minor and subject.guardian_name else GivenBy.SELF
 
 
 def _complete_click(
@@ -66,7 +66,7 @@ def _complete_click(
             savepoint.rollback()
             return None
         subject = complete_consent_verification(db, verification, now)
-    except LookupError:  # includes InviteAlreadyUsed
+    except (LookupError, IntegrityError):  # LookupError includes InviteAlreadyUsed
         savepoint.rollback()
         return None
     except BaseException:
@@ -78,7 +78,7 @@ def _complete_click(
 
 def _withdraw(db: Session, subjects: list[Subject], purposes: list[str], source: ConsentSource, now: datetime) -> None:
     for subject in subjects:
-        set_consent(db, subject, dict.fromkeys(purposes, False), source=source, given_by=_given_by(subject), now=now)
+        set_consent(db, subject, dict.fromkeys(purposes, False), source=source, given_by=given_by_for(subject), now=now)
 
 
 def _outcome(

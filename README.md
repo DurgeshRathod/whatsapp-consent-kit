@@ -125,11 +125,23 @@ kit.audit_by_phone(db, owner_id, "+919876543210")
 ## WhatsApp webhook
 
 ```python
+from whatsapp_consent.meta import InvalidSignature, InvalidWebhookPayload
+
+
 @app.post("/webhooks/whatsapp")
 async def webhook(request: Request, db: Session = Depends(get_db)):
-    events = kit.parse_webhook(await request.body(), request.headers.get("X-Hub-Signature-256"))
-    for owner_id, owner_events in group_by_owner(events):   # map phone_number_id -> owner
-        for outcome in kit.handle_inbound(db, owner_id, owner_events):
+    try:
+        events = kit.parse_webhook(await request.body(), request.headers.get("X-Hub-Signature-256"))
+    except InvalidSignature:
+        raise HTTPException(403)
+    except InvalidWebhookPayload:
+        raise HTTPException(400)
+    by_number: dict[str, list] = {}
+    for event in events:
+        by_number.setdefault(event.phone_number_id, []).append(event)
+    for phone_number_id, number_events in by_number.items():
+        owner_id = owner_for_number(phone_number_id)   # your mapping; skip numbers you don't know
+        for outcome in kit.handle_inbound(db, owner_id, number_events):  # one phone_number_id per call
             ...  # e.g. reply with outcome.preferences_url inside the 24-hour window
     db.commit()
 ```

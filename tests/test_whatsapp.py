@@ -339,11 +339,23 @@ def test_a_held_submission_is_applied_by_the_start_code(kit, click_client, owner
     assert info["consents"] == {"service": True, "updates": False}
 
 
-def test_another_owners_start_code_is_ignored(kit, click_client, owner):
-    from whatsapp_consent.enums import InboundOutcomeType
+def click_row(db, subject_id):
+    from whatsapp_consent.enums import VerificationMethod
     from whatsapp_consent.models import Verification
 
-    _, headers = owner(whatsapp_number="+919800000001")
+    row = db.scalar(
+        select(Verification).where(
+            Verification.subject_id == uuid.UUID(subject_id), Verification.method == VerificationMethod.CLICK_TO_CHAT
+        )
+    )
+    assert row is not None
+    return row
+
+
+def test_another_owners_start_code_is_ignored(kit, click_client, owner):
+    from whatsapp_consent.enums import InboundOutcomeType
+
+    owner_id, headers = owner(whatsapp_number="+919800000001")
     other_id, _ = owner(display_name="Ravi Fitness")
     subject_id, _, data, start_text = held_click(click_client, headers)
     (outcome,) = inbound(kit, other_id, payload(text_message(e164(data["phone"]), start_text)))
@@ -351,13 +363,14 @@ def test_another_owners_start_code_is_ignored(kit, click_client, owner):
     info = click_client.get(f"/subjects/{subject_id}", headers=headers).json()
     assert info["verified"] is False and info["consents"] == {"service": False, "updates": False}
     with committed_session() as db:
-        row = db.scalar(select(Verification).where(Verification.subject_id == uuid.UUID(subject_id)))
-        assert row is not None and row.verified_at is None and row.pending is not None
+        row = click_row(db, subject_id)
+        assert row.verified_at is None and row.pending is not None
+    (later,) = inbound(kit, owner_id, payload(text_message(e164(data["phone"]), start_text)))
+    assert later.type == InboundOutcomeType.VERIFIED
 
 
 def test_an_invite_revoked_after_the_hold_is_ignored_and_nothing_is_kept(kit, click_client, owner):
     from whatsapp_consent.enums import InboundOutcomeType
-    from whatsapp_consent.models import Verification
 
     owner_id, headers = owner(whatsapp_number="+919800000001")
     subject_id, _, data, start_text = held_click(click_client, headers)
@@ -368,8 +381,8 @@ def test_an_invite_revoked_after_the_hold_is_ignored_and_nothing_is_kept(kit, cl
     assert info["verified"] is False and info["consents"] == {"service": False, "updates": False}
     assert info["display_name"] == "Asha"
     with committed_session() as db:
-        row = db.scalar(select(Verification).where(Verification.subject_id == uuid.UUID(subject_id)))
-        assert row is not None and row.verified_at is None and row.pending is not None
+        row = click_row(db, subject_id)
+        assert row.verified_at is None and row.pending is not None
 
 
 def test_the_same_start_text_twice_is_applied_once(kit, click_client, owner):
@@ -442,3 +455,100 @@ def test_invalid_signature_headers_never_raise_anything_else():
     for header in ("sha256=é\ud800", "sha256=" + "0" * 64, " ", "SHA256=abc"):
         with pytest.raises(InvalidSignature):
             verify_signature(b"{}", header, "app-secret")
+
+
+# Fix round 1
+
+
+def test_a_failing_completion_does_not_lose_the_rest_of_the_batch(kit, click_client, owner):
+    from whatsapp_consent.enums import InboundOutcomeType
+
+    owner_id, headers = owner(whatsapp_number="+919800000001")
+    stopper_id, stopper_phone = verified_subject(click_client, headers)
+    phone = local_phone()
+    # Bob's held submission renames him to Asha at the number; the owner then adds another Asha there.
+    bob_id, bob_path = add_subject(click_client, headers, display_name="Bob", phone=phone)
+    assert submit(click_client, bob_path, "me", adult(name="Asha", phone=phone)).status_code == 303
+    import re
+    from urllib.parse import unquote
+
+    match = re.search(r"text=(START-[^\"&]+)", text_of(click_client.get("/c/verify")))
+    assert match
+    add_subject(click_client, headers, display_name="Asha", phone=phone)
+    outcomes = inbound(
+        kit,
+        owner_id,
+        payload(text_message(e164(phone), unquote(match[1])), text_message(stopper_phone, "STOP")),
+    )
+    assert [o.type for o in outcomes] == [InboundOutcomeType.IGNORED, InboundOutcomeType.WITHDRAWN]
+    assert consents(click_client, headers, stopper_id) == {"service": False, "updates": False}
+    assert click_client.get(f"/subjects/{bob_id}", headers=headers).json()["verified"] is False
+
+
+@pytest.mark.parametrize(
+    "word",
+    [
+        "\u201cSTOP\u201d",
+        "Stop\u2026",
+        "stop\u2019",
+        "STOP \U0001f6d1",
+        "\uff33\uff34\uff2f\uff30",
+        "\u0930\u094b\u0915\u0947\u0902\u200d",
+    ],
+)
+def test_stop_matches_through_unicode_decoration(word):
+    from whatsapp_consent.inbound import STOP_WORDS, normalise_words
+
+    assert normalise_words(word) in STOP_WORDS
+
+
+@pytest.mark.parametrize("word", ["stopwatch", "please stop", "nonstop", "stop it"])
+def test_stop_needs_the_whole_message(word):
+    from whatsapp_consent.inbound import STOP_WORDS, normalise_words
+
+    assert normalise_words(word) not in STOP_WORDS
+
+
+def test_given_by_follows_the_single_minor_rule():
+    from whatsapp_consent.enums import GivenBy
+    from whatsapp_consent.events import given_by_for
+    from whatsapp_consent.models import Subject
+
+    assert given_by_for(Subject(is_minor=False, guardian_name=None)) == GivenBy.SELF
+    assert given_by_for(Subject(is_minor=True, guardian_name=None)) == GivenBy.SELF
+    assert given_by_for(Subject(is_minor=True, guardian_name="Meera")) == GivenBy.GUARDIAN
+
+
+def test_malformed_signed_bodies_raise_one_error(kit, monkeypatch):
+    from whatsapp_consent.meta import InvalidWebhookPayload
+
+    monkeypatch.setattr(kit.settings, "meta_app_secret", "app-secret")
+
+    def signed(raw: bytes):
+        signature = "sha256=" + hmac.new(b"app-secret", raw, hashlib.sha256).hexdigest()
+        return kit.parse_webhook(raw, signature)
+
+    bodies = [
+        b"not json",
+        b"\xff\xfe",
+        b"[]",
+        b'{"entry": null}',
+        b'{"entry": ["x"]}',
+        b'{"entry": [{"changes": [{"field": "messages", "value": {"messages": "x"}}]}]}',
+        b'{"entry": [{"changes": [{"field": "messages", "value": {"statuses": [{"errors": [{"code": "abc"}]}]}}]}]}',
+        b"[" * 100000 + b"]" * 100000,
+    ]
+    for raw in bodies:
+        with pytest.raises(InvalidWebhookPayload):
+            signed(raw)
+    assert signed(b"{}") == []
+
+
+def test_handle_inbound_refuses_a_mixed_batch(kit):
+    from whatsapp_consent.meta import parse_webhook
+
+    events = parse_webhook(payload(text_message("+919811111111", "STOP"), pnid="A")) + parse_webhook(
+        payload(text_message("+919811111111", "STOP"), pnid="B")
+    )
+    with committed_session() as db, pytest.raises(ValueError, match="phone_number_id"):
+        kit.handle_inbound(db, uuid.uuid4(), events)

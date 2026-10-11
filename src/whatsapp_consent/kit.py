@@ -15,7 +15,7 @@ from whatsapp_consent.enums import DataRequestSource, Language, TemplateCategory
 from whatsapp_consent.erasure import erase_owner, erase_subject, run_maintenance
 from whatsapp_consent.gate import can_send, can_send_category, sendable_subjects
 from whatsapp_consent.inbound import InboundOutcome, handle_inbound
-from whatsapp_consent.meta import InboundEvent, parse_webhook, verify_signature
+from whatsapp_consent.meta import InboundEvent, InvalidWebhookPayload, parse_webhook, verify_signature
 from whatsapp_consent.models import DataRequest, Subject
 from whatsapp_consent.senders import VerificationSender, resolve_sender
 from whatsapp_consent.status import SubjectState, state_of, status_by_phone
@@ -133,12 +133,20 @@ class ConsentKit:
     # WhatsApp
 
     def parse_webhook(self, raw_body: bytes, signature_header: str | None) -> list[InboundEvent]:
-        """Checks the signature with CONSENT_META_APP_SECRET, then parses. Raises InvalidSignature."""
+        """Checks the signature with CONSENT_META_APP_SECRET, then parses. Raises InvalidSignature (reply 403) or
+        InvalidWebhookPayload (a signed body that is malformed: reply 400)."""
         if not self.settings.meta_app_secret:
             raise RuntimeError("Set CONSENT_META_APP_SECRET to check webhook signatures")
         verify_signature(raw_body, signature_header, self.settings.meta_app_secret)
-        return parse_webhook(json.loads(raw_body))
+        try:
+            body = json.loads(raw_body)
+        except (ValueError, RecursionError) as error:
+            raise InvalidWebhookPayload("webhook body is not valid JSON") from error
+        return parse_webhook(body)
 
     def handle_inbound(self, db: Session, owner_id: uuid.UUID, events: list[InboundEvent]) -> list[InboundOutcome]:
-        """The host maps each event's phone_number_id to its owner, calls this, commits, and acts on the outcomes."""
+        """The host maps a phone_number_id to its owner, calls this with that number's events, commits, and acts on
+        the outcomes. Raises ValueError if the events come from more than one phone_number_id."""
+        if len({event.phone_number_id for event in events}) > 1:
+            raise ValueError("Group events by phone_number_id: one owner per call")
         return handle_inbound(db, owner_id=owner_id, events=events, settings=self.settings)

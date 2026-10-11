@@ -45,7 +45,8 @@ def current_consent(db: Session, subject_id: uuid.UUID) -> dict[str, bool]:
 
 
 def given_by_for(subject: Subject) -> GivenBy:
-    return GivenBy.GUARDIAN if subject.is_minor else GivenBy.SELF
+    """GUARDIAN only for a minor with guardian details on record; otherwise the person acting is SELF."""
+    return GivenBy.GUARDIAN if subject.is_minor and subject.guardian_name else GivenBy.SELF
 
 
 def record_event(
