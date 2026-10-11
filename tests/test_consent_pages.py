@@ -741,3 +741,32 @@ def test_a_late_cleared_click_row_does_not_drop_a_newer_flow(click_client, owner
     assert res.status_code == 303 and res.headers["location"].startswith("/c/done")
     info = detail(click_client, headers, subject_id)
     assert (info["consents"], info["birthday_day"]) == ({"service": True, "updates": False}, 9)
+
+
+def test_a_completion_that_applies_nothing_leaves_invites_usable(db, make_subject):
+    from whatsapp_consent.enums import InviteKind, VerificationMethod, VerificationPurpose
+    from whatsapp_consent.models import Invite, Verification
+    from whatsapp_consent.submissions import complete_consent_verification
+
+    subject = make_subject(verified=False)
+    new_link = Invite(
+        owner_id=subject.owner_id,
+        kind=InviteKind.PERSONAL,
+        subject_id=subject.id,
+        token_hash=uuid.uuid4().hex,
+        expires_at=datetime.now(UTC) + timedelta(days=7),
+    )
+    # A click from a hold that a newer submission superseded: nothing is held on the row any more.
+    stale = Verification(
+        subject_id=subject.id,
+        phone_e164=subject.phone_e164,
+        purpose=VerificationPurpose.CONSENT,
+        method=VerificationMethod.FAKE,
+        code_hash="x",
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    db.add_all([new_link, stale])
+    db.flush()
+    complete_consent_verification(db, stale)
+    db.refresh(new_link)
+    assert new_link.used_at is None

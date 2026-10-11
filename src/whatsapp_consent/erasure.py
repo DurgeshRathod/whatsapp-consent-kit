@@ -71,8 +71,9 @@ def erase_subject(
     # ON DELETE SET NULL clears subject_id on consent_events and data_requests; consent_state and invites cascade.
     db.execute(delete(Subject).where(Subject.id == subject_id))
     if not db.scalar(select(func.count()).select_from(Subject).where(Subject.phone_e164 == phone)):
-        # Phone-only rows (no subject) belong to nobody now, unless another owner's subject has the same number.
-        db.execute(delete(Verification).where(Verification.subject_id.is_(None), Verification.phone_e164 == phone))
+        # Unverified rows for this number belong to nobody now, whichever subject they hang on (a held submission
+        # carries a name, IP and user agent), unless another subject still has the number.
+        db.execute(delete(Verification).where(Verification.phone_e164 == phone, Verification.verified_at.is_(None)))
     if not db.scalar(select(func.count()).select_from(Subject).where(Subject.phone_fingerprint == fingerprint)):
         revoke_preference_links(db, fingerprint, now)
     request.completed_at = now

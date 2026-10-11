@@ -339,3 +339,27 @@ def test_activity_is_per_owner(client, owner, kit):
         kit.erase_subject(db, uuid.UUID(mine_id), DataRequestSource.SUBJECT)
     assert len(client.get("/subjects/activity", headers=mine).json()) == 1
     assert client.get("/subjects/activity", headers=theirs).json() == []
+
+
+def test_erasure_removes_unverified_rows_held_for_the_number_under_another_subject(db, make_subject):
+    from whatsapp_consent.enums import DataRequestSource, VerificationMethod, VerificationPurpose
+    from whatsapp_consent.erasure import erase_subject
+    from whatsapp_consent.models import Verification
+
+    phone = random_phone()
+    owner = uuid.uuid4()
+    erased, other = make_subject(owner=owner, phone=phone, name="Y"), make_subject(owner=owner, name="X")
+    db.add(
+        Verification(
+            subject_id=other.id,  # a personal link for X, where the person typed Y's number
+            phone_e164=phone,
+            purpose=VerificationPurpose.CONSENT,
+            method=VerificationMethod.FAKE,
+            code_hash="x",
+            expires_at=datetime.now(UTC) + timedelta(minutes=5),
+            pending={"ip": "10.0.0.1", "user_agent": "test-agent", "submission": {"display_name": "X2"}},
+        )
+    )
+    db.flush()
+    erase_subject(db, erased, source=DataRequestSource.SUBJECT)
+    assert count(db, Verification, Verification.phone_e164 == phone) == 0

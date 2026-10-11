@@ -4,7 +4,19 @@ import uuid
 from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, SmallInteger, Text, func
+from sqlalchemy import (
+    Boolean,
+    Date,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    SmallInteger,
+    Text,
+    UniqueConstraint,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import Uuid
@@ -41,6 +53,10 @@ class Subject(ConsentBase):
 
     __tablename__ = "subjects"
 
+    __table_args__ = (
+        Index("uq_subjects_owner_phone_name", "owner_id", "phone_e164", text("lower(display_name)"), unique=True),
+    )
+
     id: Mapped[uuid.UUID] = id_column()
     owner_id: Mapped[uuid.UUID] = mapped_column(Uuid, index=True)
     display_name: Mapped[str] = mapped_column(Text)
@@ -64,6 +80,15 @@ class Invite(ConsentBase):
     """A consent link: personal (one subject, single use, expires) or practice (reusable, one active per owner)."""
 
     __tablename__ = "invites"
+
+    __table_args__ = (
+        Index(
+            "uq_invites_one_active_practice",
+            "owner_id",
+            unique=True,
+            postgresql_where=text("kind = 'practice' AND revoked_at IS NULL"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = id_column()
     owner_id: Mapped[uuid.UUID] = mapped_column(Uuid, index=True)
@@ -96,6 +121,8 @@ class Notice(ConsentBase):
     """Host content: the notice a person was shown. Never edited; a change is a new version."""
 
     __tablename__ = "notices"
+
+    __table_args__ = (UniqueConstraint("version", "language", name="uq_notices_version_language"),)
 
     id: Mapped[uuid.UUID] = id_column()
     version: Mapped[int] = mapped_column(Integer)
@@ -152,6 +179,8 @@ class ConsentState(ConsentBase):
 class Verification(ConsentBase):
     __tablename__ = "verifications"
 
+    __table_args__ = (Index("ix_verifications_phone_created", "phone_e164", "created_at"),)
+
     id: Mapped[uuid.UUID] = id_column()
     subject_id: Mapped[uuid.UUID | None] = mapped_column(_fk("subjects.id", ondelete="CASCADE"), index=True)
     phone_e164: Mapped[str] = mapped_column(Text)
@@ -198,6 +227,8 @@ class DataRequest(ConsentBase):
 
 class RateLimitEvent(ConsentBase):
     __tablename__ = "rate_limit_events"
+
+    __table_args__ = (Index("ix_rate_limit_events_lookup", "bucket", "key_hash", "created_at"),)
 
     id: Mapped[uuid.UUID] = id_column()
     bucket: Mapped[str] = mapped_column(Text)

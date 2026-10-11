@@ -108,6 +108,19 @@ app.include_router(kit.owner_router(prefix="/clients"))
 app.include_router(kit.public_router())
 ```
 
+A sender is any class with a `method` and `send_code`:
+
+```python
+from whatsapp_consent.enums import VerificationMethod
+from whatsapp_consent.senders import VerificationSender
+
+class QueuedTemplateSender:  # satisfies VerificationSender
+    method = VerificationMethod.AUTHENTICATION_TEMPLATE
+
+    def send_code(self, phone_e164: str, code: str, language: Language) -> None:
+        queue.enqueue(send_authentication_template, phone_e164, code, language.value)  # returns at once
+```
+
 Your sender's `send_code` runs inside the request. Keep it fast (queue the WhatsApp call) so a page's response time
 doesn't depend on whether a code was really sent: the preferences lookup gives the same answer for registered and
 unregistered numbers, and timing is part of that answer.
@@ -146,7 +159,18 @@ async def webhook(request: Request, db: Session = Depends(get_db)):
     db.commit()
 ```
 
-Add `whatsapp_consent.messages.opt_out_footer(...)` and `stop_button(...)` to marketing templates.
+Add `whatsapp_consent.messages.opt_out_footer(...)` and `stop_button(...)` to marketing templates. When you send
+one, pass the matching payload parameter with the send, or a tap arrives as plain text and is ignored:
+
+```python
+from whatsapp_consent.messages import manage_button_parameter, stop_button_parameter
+
+components = [
+    # ...body parameters...
+    stop_button_parameter("updates", index=0),   # the purpose this message was sent under
+    manage_button_parameter(index=1),            # only if the template has a manage button
+]
+```
 
 ## Daily maintenance
 
@@ -162,6 +186,10 @@ hook can add `--cleanup-unverified-without-host-hook`.
   when it isn't registered, so the answer looks the same either way.
 - A minor's own number (no guardian on record) can withdraw consent but never grant it; only a guardian's verified
   consent can.
+- Guardian consent is a declaration: a minor holding the guardian link could declare a guardian on their own
+  number. Owners who mark minors should review guardian sign-ups.
+- If a new notice version is published in only some languages, the other languages keep showing their latest
+  version.
 
 ## Before launch
 

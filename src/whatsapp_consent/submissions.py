@@ -162,16 +162,17 @@ def complete_consent_verification(db: Session, verification: Verification, now: 
         subject.phone_verified_at = now
     else:
         _apply_held(db, subject, verification, held, now)
-    db.execute(
-        update(Invite)
-        .where(
-            Invite.subject_id == subject.id,
-            Invite.kind == InviteKind.PERSONAL,
-            Invite.used_at.is_(None),
-            Invite.revoked_at.is_(None),
+        # Only the invite this submission came through is spent; a newer link the owner issued stays usable.
+        db.execute(
+            update(Invite)
+            .where(
+                Invite.id == uuid.UUID(held["invite_id"]),
+                Invite.kind == InviteKind.PERSONAL,
+                Invite.used_at.is_(None),
+                Invite.revoked_at.is_(None),
+            )
+            .values(used_at=now)
         )
-        .values(used_at=now)
-    )
     db.flush()
     return subject
 

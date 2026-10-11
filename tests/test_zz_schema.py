@@ -89,6 +89,26 @@ def test_models_match_the_migration(engine):
     assert in_db == in_models
 
 
+def test_models_match_the_migrated_schema_for_autogenerate(engine):
+    """A future `alembic revision --autogenerate` must propose nothing for an unchanged model."""
+    from alembic.autogenerate import compare_metadata
+    from alembic.migration import MigrationContext
+
+    import whatsapp_consent.models  # noqa: F401
+    from whatsapp_consent.db import ConsentBase
+
+    with engine.connect() as conn:
+        context = MigrationContext.configure(
+            conn,
+            opts={
+                "include_schemas": True,
+                "version_table_schema": S,
+                "include_name": lambda name, type_, parent: (name in (None, S)) if type_ == "schema" else True,
+            },
+        )
+        assert compare_metadata(context, ConsentBase.metadata) == []
+
+
 ENUM_COLUMNS = {
     ("subjects", "source"): "SubjectSource",
     ("subjects", "language"): "Language",

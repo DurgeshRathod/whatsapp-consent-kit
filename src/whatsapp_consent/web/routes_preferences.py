@@ -12,12 +12,11 @@ from sqlalchemy.orm import Session
 from whatsapp_consent.enums import (
     ConsentSource,
     DataRequestSource,
-    GivenBy,
     Language,
     VerificationMethod,
     VerificationPurpose,
 )
-from whatsapp_consent.events import Evidence, active_purposes, current_consent, purpose_codes, set_consent
+from whatsapp_consent.events import Evidence, active_purposes, current_consent, given_by_for, purpose_codes, set_consent
 from whatsapp_consent.hashing import hash_code, new_code, phone_fingerprint
 from whatsapp_consent.models import PreferenceLink, Subject, Verification
 from whatsapp_consent.notices import latest_notice
@@ -353,7 +352,7 @@ def build(kit: "ConsentKit", pages: Pages) -> APIRouter:
             subject,
             wanted,
             source=ConsentSource.PREFERENCES_PAGE,
-            given_by=GivenBy.GUARDIAN if has_guardian else GivenBy.SELF,
+            given_by=given_by_for(subject),
             notice=latest_notice(db, language),
             evidence=Evidence(client_ip(request), request.headers.get("user-agent")),
         )
