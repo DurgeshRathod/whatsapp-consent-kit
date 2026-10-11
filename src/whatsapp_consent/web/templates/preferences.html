@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ t('prefs_title') }}</h1>
+<p class="muted">{{ t('prefs_intro') }}</p>
+{% if saved %}<p role="status">{{ t('saved') }}</p>{% endif %}
+{% if errors %}
+<div class="errors" role="alert">{% for e in errors %}<p>{{ t(e) }}</p>{% endfor %}</div>
+{% endif %}
+{% if not entries %}<p>{{ t('no_subjects') }}</p>{% endif %}
+{% for e in entries %}
+<section class="panel">
+<h2>{{ e.business }}</h2>
+{% if e.subject.is_minor %}<p class="muted">{{ t('for_child', name=e.subject.display_name) }}</p>{% endif %}
+<form method="post" action="/p/{{ token }}/subjects/{{ e.subject.id }}">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="lang" value="{{ lang }}">
+{% for p in purposes %}
+<label class="check"><input type="checkbox" name="purposes" value="{{ p.code }}"{% if e.consent.get(p.code) %} checked{% endif %}><span><strong>{{ p.labels[lang].name }}</strong>: {{ p.labels[lang].description }}</span></label>
+{% endfor %}
+<button type="submit">{{ t('save') }}</button>
+</form>
+<form method="post" action="/p/{{ token }}/delete">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="lang" value="{{ lang }}">
+<input type="hidden" name="target" value="{{ e.subject.id }}">
+<button type="submit" class="secondary">{{ t('delete_data') }}</button>
+</form>
+</section>
+{% endfor %}
+{% if entries|length > 1 %}
+<form method="post" action="/p/{{ token }}/delete">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="lang" value="{{ lang }}">
+<input type="hidden" name="target" value="all">
+<button type="submit" class="danger">{{ t('delete_all') }}</button>
+</form>
+{% endif %}
+<p class="notice"><a href="/notice/{{ notice.version }}?lang={{ lang }}">{{ t('read_notice') }}</a></p>
+{% endblock %}
