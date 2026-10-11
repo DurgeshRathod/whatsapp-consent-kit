@@ -1,5 +1,6 @@
 """ConsentKit: a host's configuration, and the kit's public Python API and routers."""
 
+import json
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -13,6 +14,8 @@ from whatsapp_consent.config import ConsentSettings
 from whatsapp_consent.enums import DataRequestSource, Language, TemplateCategory
 from whatsapp_consent.erasure import erase_owner, erase_subject, run_maintenance
 from whatsapp_consent.gate import can_send, can_send_category, sendable_subjects
+from whatsapp_consent.inbound import InboundOutcome, handle_inbound
+from whatsapp_consent.meta import InboundEvent, parse_webhook, verify_signature
 from whatsapp_consent.models import DataRequest, Subject
 from whatsapp_consent.senders import VerificationSender, resolve_sender
 from whatsapp_consent.status import SubjectState, state_of, status_by_phone
@@ -126,3 +129,16 @@ class ConsentKit:
         router.include_router(routes_notice.build(self, pages))
         router.include_router(routes_preferences.build(self, pages))
         return router
+
+    # WhatsApp
+
+    def parse_webhook(self, raw_body: bytes, signature_header: str | None) -> list[InboundEvent]:
+        """Checks the signature with CONSENT_META_APP_SECRET, then parses. Raises InvalidSignature."""
+        if not self.settings.meta_app_secret:
+            raise RuntimeError("Set CONSENT_META_APP_SECRET to check webhook signatures")
+        verify_signature(raw_body, signature_header, self.settings.meta_app_secret)
+        return parse_webhook(json.loads(raw_body))
+
+    def handle_inbound(self, db: Session, owner_id: uuid.UUID, events: list[InboundEvent]) -> list[InboundOutcome]:
+        """The host maps each event's phone_number_id to its owner, calls this, commits, and acts on the outcomes."""
+        return handle_inbound(db, owner_id=owner_id, events=events, settings=self.settings)
