@@ -12,9 +12,9 @@ and Meta's WhatsApp opt-in rules.
 The kit stores no health data and never stores inbound message text. It never sends messages: you send codes through
 your own sender and act on the outcomes it returns.
 
-> **Status:** v0.1.0 is in development on the
-> [`feat/v0.1.0`](https://github.com/DurgeshRathod/whatsapp-consent-kit/tree/feat/v0.1.0) branch. The design is in
-> [`docs/specs`](docs/specs/2026-10-11-whatsapp-consent-kit-design.md) and the build plan in [`docs/plans`](docs/plans).
+> **Status:** v0.1.0. The design is in [`docs/specs`](docs/specs/2026-10-11-whatsapp-consent-kit-design.md) and the
+> build plan in [`docs/plans`](docs/plans). Before production, confirm Meta's marketing opt-out error code (131050) and
+> the click-to-chat inbound format with a real test number.
 
 ## How consent works
 
@@ -111,14 +111,17 @@ app.include_router(kit.public_router())
 A sender is any class with a `method` and `send_code`:
 
 ```python
+from whatsapp_consent import Language
 from whatsapp_consent.enums import VerificationMethod
 from whatsapp_consent.senders import VerificationSender
 
-class QueuedTemplateSender:  # satisfies VerificationSender
+class QueuedTemplateSender:
     method = VerificationMethod.AUTHENTICATION_TEMPLATE
 
     def send_code(self, phone_e164: str, code: str, language: Language) -> None:
         queue.enqueue(send_authentication_template, phone_e164, code, language.value)  # returns at once
+
+my_authentication_template_sender: VerificationSender = QueuedTemplateSender()
 ```
 
 Your sender's `send_code` runs inside the request. Keep it fast (queue the WhatsApp call) so a page's response time
