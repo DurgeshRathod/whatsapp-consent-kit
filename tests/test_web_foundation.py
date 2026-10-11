@@ -152,7 +152,8 @@ def test_tampered_flow_cookie_reads_as_none(pages):
     response = Response()
     pages.write_flow(response, {"l": "en"})
     value = _cookie_value(_set_cookie(response, FLOW_COOKIE))
-    tampered = value[:-1] + ("A" if value[-1] != "A" else "B")
+    # Change the payload, not the last signature character: its low base64 bits can be ignored on decode.
+    tampered = ("A" if value[0] != "A" else "B") + value[1:]
     assert pages.read_flow(_request({FLOW_COOKIE: tampered})) is None
 
 
