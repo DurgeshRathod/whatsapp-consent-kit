@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from whatsapp_consent.api.schemas import (
+    ActivityOut,
     NewSubjectIn,
     NewSubjectOut,
     PracticeLinkOut,
@@ -19,11 +20,11 @@ from whatsapp_consent.api.schemas import (
 )
 from whatsapp_consent.api.share import consent_link, qr_svg, share_link
 from whatsapp_consent.api.views import subject_detail_out, subject_out, subjects_out
-from whatsapp_consent.enums import ConsentSource, SubjectStatus
+from whatsapp_consent.enums import ConsentSource, DataRequestSource, SubjectStatus
 from whatsapp_consent.events import given_by_for, purpose_codes, set_consent
 from whatsapp_consent.gate import sendable_subjects
 from whatsapp_consent.invites import get_practice_invite, issue_personal_invite, rotate_practice_invite
-from whatsapp_consent.models import Subject
+from whatsapp_consent.models import DataRequest, Subject
 from whatsapp_consent.phones import InvalidPhone, normalise_phone
 from whatsapp_consent.status import subjects_by_phone
 from whatsapp_consent.subjects import DuplicateSubject, create_subject
@@ -139,6 +140,30 @@ def build_owner_router(kit: "ConsentKit", prefix: str) -> APIRouter:
         db.commit()
         return practice_out(issued.token)
 
+    @router.get("/activity")
+    def activity(
+        owner: Annotated[OwnerContext, Depends(kit.owner_dependency)],
+        db: Annotated[Session, Depends(kit.session_dependency)],
+    ) -> list[ActivityOut]:
+        """Things that happened without the owner: deletions requested by subjects, stale sign-ups removed."""
+        requests = db.scalars(
+            select(DataRequest)
+            .where(
+                DataRequest.owner_id == owner.owner_id,
+                DataRequest.source.in_((DataRequestSource.SUBJECT, DataRequestSource.SYSTEM)),
+                DataRequest.completed_at.is_not(None),
+            )
+            .order_by(DataRequest.completed_at.desc())
+            .limit(50)
+        )
+        return [
+            ActivityOut(
+                kind="subject_deleted_data" if r.source == DataRequestSource.SUBJECT else "unverified_signup_removed",
+                occurred_at=r.completed_at,  # pyright: ignore[reportArgumentType]
+            )
+            for r in requests
+        ]
+
     @router.get("/{subject_id}")
     def get_subject(
         subject_id: uuid.UUID,
@@ -197,5 +222,16 @@ def build_owner_router(kit: "ConsentKit", prefix: str) -> APIRouter:
         issued = issue_personal_invite(db, subject, minor_only=True)
         db.commit()
         return share_link(kit.settings, owner.info, subject, issued.token)
+
+    @router.delete("/{subject_id}", status_code=status.HTTP_204_NO_CONTENT)
+    def remove(
+        subject_id: uuid.UUID,
+        owner: Annotated[OwnerContext, Depends(kit.owner_dependency)],
+        db: Annotated[Session, Depends(kit.session_dependency)],
+    ) -> None:
+        """Erases the subject: personal data now, anonymised evidence after the retention period."""
+        own(db, owner, subject_id)
+        kit.erase_subject(db, subject_id, DataRequestSource.OWNER)
+        db.commit()
 
     return router

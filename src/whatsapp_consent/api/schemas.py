@@ -1,6 +1,6 @@
 import uuid
 from datetime import date, datetime
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, StringConstraints, model_validator
 
@@ -92,3 +92,8 @@ class SendableOut(BaseModel):
     purpose: str
     count: int
     subject_ids: list[uuid.UUID]
+
+
+class ActivityOut(BaseModel):
+    kind: Literal["subject_deleted_data", "unverified_signup_removed"]
+    occurred_at: datetime

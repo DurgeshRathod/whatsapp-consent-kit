@@ -10,9 +10,10 @@ from sqlalchemy.orm import Session
 
 from whatsapp_consent.audit import AuditRecord, audit_phone, audit_subject
 from whatsapp_consent.config import ConsentSettings
-from whatsapp_consent.enums import Language, TemplateCategory
+from whatsapp_consent.enums import DataRequestSource, Language, TemplateCategory
+from whatsapp_consent.erasure import erase_owner, erase_subject, run_maintenance
 from whatsapp_consent.gate import can_send, can_send_category, sendable_subjects
-from whatsapp_consent.models import Subject
+from whatsapp_consent.models import DataRequest, Subject
 from whatsapp_consent.senders import VerificationSender, resolve_sender
 from whatsapp_consent.status import SubjectState, state_of, status_by_phone
 
@@ -91,6 +92,21 @@ class ConsentKit:
 
     def audit_by_phone(self, db: Session, owner_id: uuid.UUID, phone: str) -> AuditRecord:
         return audit_phone(db, owner_id, phone, key=self.key)
+
+    # Erasure and retention
+
+    def erase_subject(self, db: Session, subject_id: uuid.UUID, source: DataRequestSource) -> DataRequest | None:
+        subject = db.get(Subject, subject_id)
+        if subject is None:
+            return None
+        return erase_subject(db, subject, source=source, on_erased=self.on_subject_erased)
+
+    def erase_owner(self, db: Session, owner_id: uuid.UUID) -> int:
+        return erase_owner(db, owner_id, on_erased=self.on_subject_erased)
+
+    def run_maintenance(self, db: Session) -> dict[str, int]:
+        """Prefer this to the CLI inside a host: it also calls the host's erasure hook."""
+        return run_maintenance(db, retention_days=self.settings.retention_days, on_erased=self.on_subject_erased)
 
     # Routers
 
