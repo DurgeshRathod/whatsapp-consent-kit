@@ -1,7 +1,7 @@
 """Public preferences pages: /p (find by number), /p/verify, /p/{token} (manage, delete)."""
 
 import uuid
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any
 
 from fastapi import APIRouter, Depends, Form, Request
@@ -18,7 +18,7 @@ from whatsapp_consent.enums import (
     VerificationPurpose,
 )
 from whatsapp_consent.events import Evidence, active_purposes, current_consent, purpose_codes, set_consent
-from whatsapp_consent.hashing import phone_fingerprint
+from whatsapp_consent.hashing import hash_code, new_code, phone_fingerprint
 from whatsapp_consent.models import PreferenceLink, Subject, Verification
 from whatsapp_consent.notices import latest_notice
 from whatsapp_consent.phones import InvalidPhone, mask_phone, normalise_phone
@@ -26,7 +26,13 @@ from whatsapp_consent.preference_links import issue_preference_link, resolve_pre
 from whatsapp_consent.preferences import preference_entries
 from whatsapp_consent.ratelimit import allow
 from whatsapp_consent.senders import VerificationSender
-from whatsapp_consent.verification import VerificationError, check_code, latest_pending, start_code_verification
+from whatsapp_consent.verification import (
+    CODE_TTL,
+    VerificationError,
+    check_code,
+    latest_pending,
+    start_code_verification,
+)
 from whatsapp_consent.web.i18n import pick_lang, t
 from whatsapp_consent.web.render import Pages
 from whatsapp_consent.web.routes_consent import client_ip
@@ -100,7 +106,7 @@ def build(kit: "ConsentKit", pages: Pages) -> APIRouter:
     def start_or_reuse(
         db: Session, phone: str, purpose: VerificationPurpose, language: Language, sender: VerificationSender
     ) -> str:
-        """Starts a code; on any refusal reuses the number's pending code. Always returns an id (maybe unknown)."""
+        """Starts a code; on any refusal reuses the number's pending code. Always returns the id of a real row."""
         try:
             return str(
                 start_code_verification(
@@ -109,7 +115,20 @@ def build(kit: "ConsentKit", pages: Pages) -> APIRouter:
             )
         except VerificationError:
             pending = latest_pending(db, phone=phone, purpose=purpose, subject_id=None)
-            return str(pending.id if pending else uuid.uuid4())
+            if pending is not None:
+                return str(pending.id)
+            # Refused by the per-number send caps (e.g. a consent code went out a moment ago) with nothing to
+            # reuse: a silent row, so the lockout after wrong guesses is the same as for any other number.
+            silent = Verification(
+                phone_e164=phone,
+                purpose=purpose,
+                method=sender.method,
+                code_hash=hash_code(kit.key, purpose.value, phone, new_code()),
+                expires_at=datetime.now(UTC) + CODE_TTL,
+            )
+            db.add(silent)
+            db.flush()
+            return str(silent.id)
 
     def lookup_form(
         request: Request, lang: Language, *, phone: str = "", errors: list[str] | None = None, status_code: int = 200

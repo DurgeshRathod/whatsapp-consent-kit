@@ -474,3 +474,51 @@ def test_starting_deletion_is_rate_limited_per_ip(client, kit, owner, relaxed_li
     sent = len(fake_sender.sent)
     res = client.post(f"{prefs_a}/delete", data={"csrf": csrf_of(page), "lang": "en", "target": id_a})
     assert res.status_code == 429 and len(fake_sender.sent) == sent
+
+
+def wrong_guesses(client, count=6):
+    import re
+
+    out = []
+    for _ in range(count):
+        page = client.get("/p/verify")
+        res = client.post("/p/verify", data={"csrf": csrf_of(page), "lang": "en", "code": "000001"})
+        found = re.search(r'role="alert">(.*?)</div>', text_of(res), re.S)
+        assert found
+        out.append((res.status_code, found.group(1)))
+    return out
+
+
+def test_lockout_is_the_same_for_a_number_that_just_received_a_consent_code(client, owner):
+    _, headers = owner()
+    data = adult()
+    _, path = add_subject(client, headers, phone=data["phone"])
+    assert submit_only(client, path, data).status_code == 303  # a consent code goes out: caps now apply
+    start_lookup(client, data["phone"])
+    recent = wrong_guesses(client)
+    start_lookup(client, local_phone())
+    quiet = wrong_guesses(client)
+    assert recent == quiet
+    assert "Too many" in recent[-1][1] or "too many" in recent[-1][1]
+
+
+def test_a_suspended_child_cannot_be_granted_through_the_parents_link(client, owner, relaxed_limits):
+    import re
+
+    _, headers = owner()
+    path = practice_path(client, headers)
+    prefs = consent_and_verify(client, path, who="child", data=guardian())
+    found = re.search(r'/subjects/([0-9a-f-]{36})"', client.get(prefs).text)
+    assert found
+    subject_id = found.group(1)
+    assert toggle(client, prefs, subject_id, []).status_code == 303  # withdrawing is always allowed
+    assert client.post(f"/subjects/{subject_id}/mark-minor", headers=headers).status_code == 200  # suspends
+    res = toggle(client, prefs, subject_id, ["service"])
+    assert res.status_code == 422 and "guardian" in text_of(res).lower()
+    assert client.get(f"/subjects/{subject_id}", headers=headers).json()["consents"]["service"] is False
+
+
+def test_delete_all_is_offered_for_a_single_entry(client, owner):
+    _, headers = owner()
+    _, path = add_subject(client, headers)
+    assert 'value="all"' in client.get(consent_and_verify(client, path)).text
